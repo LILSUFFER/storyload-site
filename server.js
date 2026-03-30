@@ -937,6 +937,11 @@ app.get("/profiles/:id", requireAuth, async (req, res) => {
       <div>
         <h1 class="page-title">${escHtml(profile.name)}</h1>
         <p class="page-sub">Manage channels for this profile</p>
+        <div class="profile-id-row" style="display:flex;align-items:center;gap:8px;margin-top:8px">
+          <span style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-weight:600">Profile ID</span>
+          <code id="pid" style="font-size:12px;color:var(--sub);background:rgba(255,255,255,.06);border:1px solid var(--border);padding:3px 10px;border-radius:6px;font-family:'JetBrains Mono',monospace;user-select:all">${profile.id}</code>
+          <button onclick="navigator.clipboard.writeText('${profile.id}').then(()=>{this.textContent='Copied!';setTimeout(()=>{this.textContent='Copy'},1500)})" style="font-size:11px;color:var(--muted);background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:6px;padding:3px 10px;cursor:pointer;font-family:inherit;transition:color .15s" onmouseover="this.style.color='#fff'" onmouseout="this.style.color=''">Copy</button>
+        </div>
       </div>
     </div>
 
