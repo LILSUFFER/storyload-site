@@ -713,8 +713,13 @@ app.get("/profiles/:id", requireAuth, async (req, res) => {
   const channels = await getProfileChannels(profile.id);
   const tiktok = channels.find(c => c.platform === "tiktok");
   const youtube = channels.find(c => c.platform === "youtube");
-  const connected = req.query.connected;
-  const error = req.query.error;
+  // Only accept known values for flash params — never render raw query input in HTML
+  const KNOWN_CONNECTED = new Set(["tiktok", "youtube"]);
+  const KNOWN_ERRORS = new Set(["state", "tiktok_auth", "youtube_auth", "auth", "name_required", "limit", "create_failed"]);
+  const connectedRaw = typeof req.query.connected === "string" ? req.query.connected : "";
+  const errorRaw = typeof req.query.error === "string" ? req.query.error : "";
+  const connected = KNOWN_CONNECTED.has(connectedRaw) ? connectedRaw : "";
+  const error = KNOWN_ERRORS.has(errorRaw) ? errorRaw : (errorRaw ? "unknown_error" : "");
 
   const channelCard = (platform, ch) => {
     const isTT = platform === "tiktok";
@@ -751,8 +756,8 @@ app.get("/profiles/:id", requireAuth, async (req, res) => {
   res.send(layout(profile.name, `
   <div class="page-wrap">
   <div class="page-content">
-    ${connected ? `<div class="alert alert-success">${connected.charAt(0).toUpperCase() + connected.slice(1)} connected successfully!</div>` : ""}
-    ${error ? `<div class="alert alert-error">Error: ${decodeURIComponent(error)}</div>` : ""}
+    ${connected === "tiktok" ? `<div class="alert alert-success">TikTok connected successfully!</div>` : connected === "youtube" ? `<div class="alert alert-success">YouTube connected successfully!</div>` : ""}
+    ${error === "tiktok_auth" ? `<div class="alert alert-error">TikTok connection failed. Please try again.</div>` : error === "youtube_auth" ? `<div class="alert alert-error">YouTube connection failed. Please try again.</div>` : error === "state" ? `<div class="alert alert-error">Session expired. Please try again.</div>` : error ? `<div class="alert alert-error">Something went wrong. Please try again.</div>` : ""}
 
     <a href="/dashboard" class="back-link">← All Profiles</a>
 
