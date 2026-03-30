@@ -85,6 +85,28 @@ async function ensureTables() {
       last_used_at TIMESTAMP
     );
   `);
+  // Publications table — tracks every publish attempt (web + API)
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS sl_publications (
+      id VARCHAR PRIMARY KEY DEFAULT gen_random_uuid()::text,
+      user_id VARCHAR NOT NULL REFERENCES sl_users(id) ON DELETE CASCADE,
+      profile_id VARCHAR REFERENCES sl_profiles(id) ON DELETE SET NULL,
+      platform TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      title TEXT,
+      description TEXT,
+      privacy TEXT DEFAULT 'private',
+      scheduled_at TIMESTAMP,
+      published_at TIMESTAMP,
+      video_id TEXT,
+      video_url TEXT,
+      publish_id TEXT,
+      error_message TEXT,
+      meta JSONB DEFAULT '{}',
+      created_at TIMESTAMP DEFAULT NOW(),
+      updated_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 }
 
 // API key auth middleware
@@ -99,6 +121,92 @@ async function requireApiKey(req, res, next) {
   req.apiUserId = rows[0].user_id;
   req.apiKeyId = rows[0].id;
   next();
+}
+
+// ── Publication helpers ───────────────────────────────────────────────────────
+function formatPublication(p) {
+  return {
+    id: p.id,
+    profile_id: p.profile_id || null,
+    platform: p.platform,
+    status: p.status,
+    title: p.title || null,
+    description: p.description || null,
+    privacy: p.privacy || "private",
+    video_id: p.video_id || null,
+    video_url: p.video_url || null,
+    publish_id: p.publish_id || null,
+    error_message: p.error_message || null,
+    scheduled_at: p.scheduled_at || null,
+    published_at: p.published_at || null,
+    created_at: p.created_at,
+    updated_at: p.updated_at,
+    meta: p.meta || {},
+  };
+}
+
+async function doPublishYouTube(ch, { title, description, privacy, filePath }) {
+  const ytClient = getGoogleClient(`${APP_URL}/auth/youtube/callback`);
+  ytClient.setCredentials({
+    access_token: ch.access_token,
+    refresh_token: ch.refresh_token || undefined,
+    expiry_date: ch.expires_at ? Number(ch.expires_at) : undefined,
+  });
+  const yt = google.youtube({ version: "v3", auth: ytClient });
+  const safeTitle = (title || "My video").substring(0, 100);
+  const safeDesc = (description || "").substring(0, 5000);
+  const allowedPrivacy = new Set(["public", "private", "unlisted"]);
+  const safePrivacy = allowedPrivacy.has(privacy) ? privacy : "private";
+  const response = await yt.videos.insert({
+    part: ["snippet", "status"],
+    requestBody: {
+      snippet: { title: safeTitle, description: safeDesc, categoryId: "22" },
+      status: { privacyStatus: safePrivacy, selfDeclaredMadeForKids: false },
+    },
+    media: { body: fs.createReadStream(filePath) },
+  });
+  const videoId = response.data.id;
+  return {
+    videoId,
+    videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+    title: response.data.snippet?.title || safeTitle,
+    privacyStatus: response.data.status?.privacyStatus || safePrivacy,
+  };
+}
+
+async function doPublishTikTok(ch, { title, filePath, fileSize }) {
+  const TARGET_CHUNK = 10 * 1024 * 1024;
+  const chunkSize = fileSize <= TARGET_CHUNK ? fileSize : TARGET_CHUNK;
+  const totalChunks = Math.ceil(fileSize / chunkSize);
+  const safeTitle = (title || "My video").substring(0, 150);
+  const initRes = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${ch.access_token}`, "Content-Type": "application/json; charset=UTF-8" },
+    body: JSON.stringify({
+      post_info: { title: safeTitle, privacy_level: "SELF_ONLY", disable_duet: false, disable_comment: false, disable_stitch: false, video_cover_timestamp_ms: 1000 },
+      source_info: { source: "FILE_UPLOAD", video_size: fileSize, chunk_size: chunkSize, total_chunk_count: totalChunks },
+    }),
+  });
+  const initData = await initRes.json();
+  if (initData.error?.code !== "ok") {
+    const errCode = initData.error?.code || "unknown";
+    const errMsg = initData.error?.message || "TikTok init failed";
+    throw Object.assign(new Error(`[${errCode}] ${errMsg}`), { tiktokCode: errCode, raw: initData });
+  }
+  const { publish_id, upload_url } = initData.data;
+  const fileBuffer = fs.readFileSync(filePath);
+  let offset = 0;
+  for (let i = 0; i < totalChunks; i++) {
+    const chunk = fileBuffer.slice(offset, offset + chunkSize);
+    const end = Math.min(offset + chunkSize - 1, fileSize - 1);
+    await fetch(upload_url, {
+      method: "PUT",
+      headers: { "Content-Type": "video/mp4", "Content-Range": `bytes ${offset}-${end}/${fileSize}`, "Content-Length": String(chunk.length) },
+      body: chunk,
+    });
+    offset += chunkSize;
+  }
+  return { publishId: publish_id };
 }
 
 // Middleware
@@ -867,122 +975,54 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
   } catch (e) { console.error("[publish-page]", e.message); res.redirect("/dashboard"); }
 });
 
-// API: publish (with profile_id)
+// API: publish (web form — uses same helpers as /v1)
 app.post("/api/publish", requireAuth, upload.single("video"), async (req, res) => {
-  try {
-    const { platform, title, profile_id } = req.body;
-    if (!req.file) return res.status(400).json({ error: "No video file" });
+  const userId = req.session.userId;
+  const profileId = (typeof req.body.profile_id === "string" && UUID_RE.test(req.body.profile_id)) ? req.body.profile_id : null;
+  const platform = req.body.platform;
+  if (!req.file) return res.status(400).json({ error: "No video file" });
+  if (!ALLOWED_PLATFORMS.has(platform)) { fs.unlinkSync(req.file.path); return res.status(400).json({ error: "Unsupported platform" }); }
 
+  let pubId;
+  try {
     let ch;
-    if (profile_id) {
-      const chs = await getProfileChannels(profile_id);
-      ch = chs.find(c => c.platform === platform && c.user_id === req.session.userId) ||
-           chs.find(c => c.platform === platform);
+    if (profileId) {
+      const chs = await getProfileChannels(profileId);
+      ch = chs.find(c => c.platform === platform && c.user_id === userId) || chs.find(c => c.platform === platform);
     } else {
-      const channels = await query("SELECT * FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id IS NULL", [req.session.userId, platform]);
-      ch = channels[0];
+      const rows = await query("SELECT * FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id IS NULL", [userId, platform]);
+      ch = rows[0];
     }
     if (!ch) { fs.unlinkSync(req.file.path); return res.status(400).json({ error: `${platform} not connected` }); }
 
+    // Create pending publication record
+    const [pub] = await query(
+      "INSERT INTO sl_publications(user_id,profile_id,platform,status,title,description,privacy) VALUES($1,$2,$3,'processing',$4,$5,$6) RETURNING *",
+      [userId, profileId, platform, req.body.title || null, req.body.description || null, req.body.privacy || "private"]
+    );
+    pubId = pub.id;
+
     if (platform === "tiktok") {
-      const fileSize = req.file.size;
-      const TARGET_CHUNK = 10 * 1024 * 1024;
-      const chunkSize = fileSize <= TARGET_CHUNK ? fileSize : TARGET_CHUNK;
-      const totalChunks = Math.ceil(fileSize / chunkSize);
-      const safeTitle = (title || req.file.originalname || "My video").substring(0, 150);
-
-      const initRes = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${ch.access_token}`, "Content-Type": "application/json; charset=UTF-8" },
-        body: JSON.stringify({
-          post_info: { title: safeTitle, privacy_level: "SELF_ONLY", disable_duet: false, disable_comment: false, disable_stitch: false, video_cover_timestamp_ms: 1000 },
-          source_info: { source: "FILE_UPLOAD", video_size: fileSize, chunk_size: chunkSize, total_chunk_count: totalChunks },
-        }),
-      });
-      const initData = await initRes.json();
-      console.log("[tiktok-init] response:", JSON.stringify(initData));
-      if (initData.error?.code !== "ok") {
-        fs.unlinkSync(req.file.path);
-        const errCode = initData.error?.code || "unknown";
-        const errMsg = initData.error?.message || "TikTok init failed";
-        let hint = "";
-        if (errCode === "access_token_invalid" || errCode === "scope_not_authorized") {
-          hint = " Try disconnecting and reconnecting your TikTok account to refresh the token.";
-        }
-        return res.status(400).json({ error: `[${errCode}] ${errMsg}${hint}`, raw: initData });
-      }
-
-      const { publish_id, upload_url } = initData.data;
-      const fileBuffer = fs.readFileSync(req.file.path);
-      let offset = 0;
-      for (let i = 0; i < totalChunks; i++) {
-        const chunk = fileBuffer.slice(offset, offset + chunkSize);
-        const end = Math.min(offset + chunkSize - 1, fileSize - 1);
-        const uploadRes = await fetch(upload_url, {
-          method: "PUT",
-          headers: { "Content-Type": "video/mp4", "Content-Range": `bytes ${offset}-${end}/${fileSize}`, "Content-Length": String(chunk.length) },
-          body: chunk,
-        });
-        console.log(`[tiktok-chunk] ${i+1}/${totalChunks} status=${uploadRes.status}`);
-        offset += chunkSize;
-      }
+      const result = await doPublishTikTok(ch, { title: req.body.title || req.file.originalname, filePath: req.file.path, fileSize: req.file.size });
       fs.unlinkSync(req.file.path);
-      return res.json({ ok: true, publishId: publish_id, platform: "tiktok", message: "Video uploaded to TikTok for processing" });
+      await query("UPDATE sl_publications SET status='published',publish_id=$1,published_at=NOW(),updated_at=NOW() WHERE id=$2", [result.publishId, pubId]);
+      return res.json({ ok: true, publication_id: pubId, publishId: result.publishId, platform: "tiktok", message: "Video uploaded to TikTok for processing" });
     }
 
     if (platform === "youtube") {
-      const ytClient = getGoogleClient(`${APP_URL}/auth/youtube/callback`);
-      ytClient.setCredentials({
-        access_token: ch.access_token,
-        refresh_token: ch.refresh_token || undefined,
-        expiry_date: ch.expires_at ? Number(ch.expires_at) : undefined,
-      });
-      const yt = google.youtube({ version: "v3", auth: ytClient });
-
-      const safeTitle = (req.body.title || req.file.originalname || "My video").substring(0, 100);
-      const description = (req.body.description || "").substring(0, 5000);
-      const allowedPrivacy = new Set(["public", "private", "unlisted"]);
-      const privacy = allowedPrivacy.has(req.body.privacy) ? req.body.privacy : "private";
-
-      console.log(`[youtube-upload] title="${safeTitle}" privacy=${privacy} size=${req.file.size}`);
-
-      const response = await yt.videos.insert({
-        part: ["snippet", "status"],
-        requestBody: {
-          snippet: {
-            title: safeTitle,
-            description,
-            categoryId: "22",
-          },
-          status: {
-            privacyStatus: privacy,
-            selfDeclaredMadeForKids: false,
-          },
-        },
-        media: { body: fs.createReadStream(req.file.path) },
-      });
-
+      console.log(`[youtube-upload] web title="${req.body.title}" privacy=${req.body.privacy} size=${req.file.size}`);
+      const result = await doPublishYouTube(ch, { title: req.body.title || req.file.originalname, description: req.body.description, privacy: req.body.privacy, filePath: req.file.path });
       fs.unlinkSync(req.file.path);
-      const videoId = response.data.id;
-      const privacyStatus = response.data.status?.privacyStatus || privacy;
-      console.log(`[youtube-upload] done videoId=${videoId}`);
-      return res.json({
-        ok: true,
-        platform: "youtube",
-        videoId,
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        title: response.data.snippet?.title || safeTitle,
-        privacyStatus,
-        message: "Video published to YouTube",
-      });
+      await query("UPDATE sl_publications SET status='published',video_id=$1,video_url=$2,privacy=$3,published_at=NOW(),updated_at=NOW() WHERE id=$4",
+        [result.videoId, result.videoUrl, result.privacyStatus, pubId]);
+      console.log(`[youtube-upload] done videoId=${result.videoId}`);
+      return res.json({ ok: true, publication_id: pubId, platform: "youtube", videoId: result.videoId, url: result.videoUrl, title: result.title, privacyStatus: result.privacyStatus, message: "Video published to YouTube" });
     }
-
-    fs.unlinkSync(req.file.path);
-    return res.status(400).json({ error: "Unsupported platform" });
   } catch (e) {
     if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+    if (pubId) await query("UPDATE sl_publications SET status='failed',error_message=$1,updated_at=NOW() WHERE id=$2", [e.message, pubId]).catch(() => {});
     console.error("[publish]", e.message);
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
 });
 
@@ -1244,55 +1284,203 @@ app.get("/v1/profiles/:id", requireApiKey, async (req, res) => {
   } catch (e) { res.status(500).json({ error: "server_error", message: e.message }); }
 });
 
-// POST /v1/profiles/:id/publish — publish video to a profile channel
+// POST /v1/profiles/:id/publish — publish video to a profile channel (keeps legacy behaviour)
 app.post("/v1/profiles/:id/publish", requireApiKey, upload.single("video"), async (req, res) => {
-  try {
-    const { platform, title } = req.body;
-    if (!platform) { if (req.file) fs.unlinkSync(req.file.path); return res.status(400).json({ error: "bad_request", message: "platform is required (tiktok or youtube)" }); }
-    if (!req.file) return res.status(400).json({ error: "bad_request", message: "video file is required (multipart/form-data field: video)" });
+  const { platform, title, description, privacy } = req.body;
+  if (!platform || !ALLOWED_PLATFORMS.has(platform)) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(400).json({ error: "bad_request", message: "platform is required: tiktok or youtube" });
+  }
+  if (!req.file) return res.status(400).json({ error: "bad_request", message: "video file is required (multipart/form-data field: video)" });
 
+  let pubId;
+  try {
     const rows = await query("SELECT * FROM sl_profiles WHERE id=$1 AND user_id=$2", [req.params.id, req.apiUserId]);
     if (!rows[0]) { fs.unlinkSync(req.file.path); return res.status(404).json({ error: "not_found", message: "Profile not found" }); }
 
     const chs = await query("SELECT * FROM sl_user_channels WHERE profile_id=$1 AND platform=$2", [req.params.id, platform]);
+    if (!chs[0]) { fs.unlinkSync(req.file.path); return res.status(400).json({ error: "channel_not_connected", message: `${platform} channel is not connected to this profile` }); }
     const ch = chs[0];
-    if (!ch) { fs.unlinkSync(req.file.path); return res.status(400).json({ error: "channel_not_connected", message: `${platform} channel is not connected to this profile` }); }
+
+    const [pub] = await query(
+      "INSERT INTO sl_publications(user_id,profile_id,platform,status,title,description,privacy) VALUES($1,$2,$3,'processing',$4,$5,$6) RETURNING *",
+      [req.apiUserId, req.params.id, platform, title || null, description || null, privacy || "private"]
+    );
+    pubId = pub.id;
 
     if (platform === "tiktok") {
-      const fileSize = req.file.size;
-      const TARGET_CHUNK = 10 * 1024 * 1024;
-      const chunkSize = fileSize <= TARGET_CHUNK ? fileSize : TARGET_CHUNK;
-      const totalChunks = Math.ceil(fileSize / chunkSize);
-      const safeTitle = (title || req.file.originalname || "My video").substring(0, 150);
-
-      const initRes = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${ch.access_token}`, "Content-Type": "application/json; charset=UTF-8" },
-        body: JSON.stringify({ post_info: { title: safeTitle, privacy_level: "SELF_ONLY", disable_duet: false, disable_comment: false, disable_stitch: false, video_cover_timestamp_ms: 1000 }, source_info: { source: "FILE_UPLOAD", video_size: fileSize, chunk_size: chunkSize, total_chunk_count: totalChunks } }),
-      });
-      const initData = await initRes.json();
-      if (initData.error?.code !== "ok") { fs.unlinkSync(req.file.path); return res.status(400).json({ error: "tiktok_error", message: initData.error?.message || "TikTok init failed", raw: initData }); }
-
-      const { publish_id, upload_url } = initData.data;
-      const fileBuffer = fs.readFileSync(req.file.path);
-      let offset = 0;
-      for (let i = 0; i < totalChunks; i++) {
-        const chunk = fileBuffer.slice(offset, offset + chunkSize);
-        const end = Math.min(offset + chunkSize - 1, fileSize - 1);
-        await fetch(upload_url, { method: "PUT", headers: { "Content-Type": "video/mp4", "Content-Range": `bytes ${offset}-${end}/${fileSize}`, "Content-Length": String(chunk.length) }, body: chunk });
-        offset += chunkSize;
-      }
+      const result = await doPublishTikTok(ch, { title: title || req.file.originalname, filePath: req.file.path, fileSize: req.file.size });
       fs.unlinkSync(req.file.path);
-      return res.json({ ok: true, publish_id, platform: "tiktok", message: "Video submitted to TikTok for processing" });
+      await query("UPDATE sl_publications SET status='published',publish_id=$1,published_at=NOW(),updated_at=NOW() WHERE id=$2", [result.publishId, pubId]);
+      const [updated] = await query("SELECT * FROM sl_publications WHERE id=$1", [pubId]);
+      return res.status(201).json({ publication: formatPublication(updated) });
     }
 
-    fs.unlinkSync(req.file.path);
-    return res.status(400).json({ error: "unsupported_platform", message: `${platform} publishing via API is not yet supported` });
+    if (platform === "youtube") {
+      const result = await doPublishYouTube(ch, { title: title || req.file.originalname, description, privacy, filePath: req.file.path });
+      fs.unlinkSync(req.file.path);
+      await query("UPDATE sl_publications SET status='published',video_id=$1,video_url=$2,privacy=$3,published_at=NOW(),updated_at=NOW() WHERE id=$4",
+        [result.videoId, result.videoUrl, result.privacyStatus, pubId]);
+      const [updated] = await query("SELECT * FROM sl_publications WHERE id=$1", [pubId]);
+      return res.status(201).json({ publication: formatPublication(updated) });
+    }
   } catch (e) {
     if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+    if (pubId) await query("UPDATE sl_publications SET status='failed',error_message=$1,updated_at=NOW() WHERE id=$2", [e.message, pubId]).catch(() => {});
     console.error("[v1/publish]", e.message);
-    res.status(500).json({ error: "server_error", message: e.message });
+    return res.status(500).json({ error: "server_error", message: e.message });
   }
+});
+
+// ── Publications CRUD ─────────────────────────────────────────────────────────
+
+// GET /v1/publications — list publications with optional filters
+app.get("/v1/publications", requireApiKey, async (req, res) => {
+  try {
+    const { profile_id, platform, status, limit = "20", offset = "0" } = req.query;
+    const lim = Math.min(Math.max(parseInt(limit) || 20, 1), 100);
+    const off = Math.max(parseInt(offset) || 0, 0);
+
+    let sql = "SELECT * FROM sl_publications WHERE user_id=$1";
+    const params = [req.apiUserId];
+    if (profile_id && UUID_RE.test(profile_id)) { params.push(profile_id); sql += ` AND profile_id=$${params.length}`; }
+    if (platform && ALLOWED_PLATFORMS.has(platform)) { params.push(platform); sql += ` AND platform=$${params.length}`; }
+    const ALLOWED_STATUSES = new Set(["pending", "processing", "published", "failed"]);
+    if (status && ALLOWED_STATUSES.has(status)) { params.push(status); sql += ` AND status=$${params.length}`; }
+    sql += " ORDER BY created_at DESC";
+    params.push(lim); sql += ` LIMIT $${params.length}`;
+    params.push(off); sql += ` OFFSET $${params.length}`;
+
+    const rows = await query(sql, params);
+
+    let countSql = "SELECT COUNT(*) FROM sl_publications WHERE user_id=$1";
+    const countParams = [req.apiUserId];
+    if (profile_id && UUID_RE.test(profile_id)) { countParams.push(profile_id); countSql += ` AND profile_id=$${countParams.length}`; }
+    if (platform && ALLOWED_PLATFORMS.has(platform)) { countParams.push(platform); countSql += ` AND platform=$${countParams.length}`; }
+    if (status && ALLOWED_STATUSES.has(status)) { countParams.push(status); countSql += ` AND status=$${countParams.length}`; }
+    const [{ count }] = await query(countSql, countParams);
+
+    res.json({ publications: rows.map(formatPublication), total: parseInt(count), limit: lim, offset: off });
+  } catch (e) { res.status(500).json({ error: "server_error", message: e.message }); }
+});
+
+// POST /v1/publications — create + immediately publish (multipart video required for published status)
+app.post("/v1/publications", requireApiKey, upload.single("video"), async (req, res) => {
+  const { profile_id, platform, title, description, privacy, status: reqStatus } = req.body;
+  const wantPublish = !reqStatus || reqStatus === "published";
+
+  if (!platform || !ALLOWED_PLATFORMS.has(platform)) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(400).json({ error: "bad_request", message: "platform is required: tiktok or youtube" });
+  }
+  if (wantPublish && !req.file) {
+    return res.status(400).json({ error: "bad_request", message: "video file required to publish (multipart field: video). Set status=draft to create without video." });
+  }
+  if (profile_id && !UUID_RE.test(profile_id)) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    return res.status(400).json({ error: "bad_request", message: "invalid profile_id format" });
+  }
+
+  let pubId;
+  try {
+    if (profile_id) {
+      const rows = await query("SELECT id FROM sl_profiles WHERE id=$1 AND user_id=$2", [profile_id, req.apiUserId]);
+      if (!rows[0]) { if (req.file) fs.unlinkSync(req.file.path); return res.status(404).json({ error: "not_found", message: "Profile not found" }); }
+    }
+
+    const initStatus = wantPublish ? "processing" : "draft";
+    const [pub] = await query(
+      "INSERT INTO sl_publications(user_id,profile_id,platform,status,title,description,privacy) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *",
+      [req.apiUserId, profile_id || null, platform, initStatus, title || null, description || null, privacy || "private"]
+    );
+    pubId = pub.id;
+
+    if (!wantPublish || !req.file) {
+      return res.status(201).json({ publication: formatPublication(pub) });
+    }
+
+    // Fetch channel
+    let ch;
+    if (profile_id) {
+      const chs = await query("SELECT * FROM sl_user_channels WHERE profile_id=$1 AND platform=$2", [profile_id, platform]);
+      ch = chs[0];
+    } else {
+      const chs = await query("SELECT * FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id IS NULL", [req.apiUserId, platform]);
+      ch = chs[0];
+    }
+    if (!ch) {
+      await query("UPDATE sl_publications SET status='failed',error_message='Channel not connected',updated_at=NOW() WHERE id=$1", [pubId]);
+      if (req.file) fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: "channel_not_connected", message: `${platform} channel is not connected` });
+    }
+
+    if (platform === "tiktok") {
+      const result = await doPublishTikTok(ch, { title: title || req.file.originalname, filePath: req.file.path, fileSize: req.file.size });
+      fs.unlinkSync(req.file.path);
+      await query("UPDATE sl_publications SET status='published',publish_id=$1,published_at=NOW(),updated_at=NOW() WHERE id=$2", [result.publishId, pubId]);
+    }
+    if (platform === "youtube") {
+      const result = await doPublishYouTube(ch, { title: title || req.file.originalname, description, privacy, filePath: req.file.path });
+      fs.unlinkSync(req.file.path);
+      await query("UPDATE sl_publications SET status='published',video_id=$1,video_url=$2,privacy=$3,published_at=NOW(),updated_at=NOW() WHERE id=$4",
+        [result.videoId, result.videoUrl, result.privacyStatus, pubId]);
+    }
+
+    const [updated] = await query("SELECT * FROM sl_publications WHERE id=$1", [pubId]);
+    return res.status(201).json({ publication: formatPublication(updated) });
+  } catch (e) {
+    if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
+    if (pubId) await query("UPDATE sl_publications SET status='failed',error_message=$1,updated_at=NOW() WHERE id=$2", [e.message, pubId]).catch(() => {});
+    console.error("[v1/publications POST]", e.message);
+    return res.status(500).json({ error: "server_error", message: e.message });
+  }
+});
+
+// GET /v1/publications/:id — single publication
+app.get("/v1/publications/:id", requireApiKey, async (req, res) => {
+  try {
+    const rows = await query("SELECT * FROM sl_publications WHERE id=$1 AND user_id=$2", [req.params.id, req.apiUserId]);
+    if (!rows[0]) return res.status(404).json({ error: "not_found", message: "Publication not found" });
+    res.json({ publication: formatPublication(rows[0]) });
+  } catch (e) { res.status(500).json({ error: "server_error", message: e.message }); }
+});
+
+// PATCH /v1/publications/:id — update editable fields (title, description, privacy, status draft→pending)
+app.patch("/v1/publications/:id", requireApiKey, async (req, res) => {
+  try {
+    const rows = await query("SELECT * FROM sl_publications WHERE id=$1 AND user_id=$2", [req.params.id, req.apiUserId]);
+    if (!rows[0]) return res.status(404).json({ error: "not_found", message: "Publication not found" });
+    const pub = rows[0];
+    if (pub.status === "published") return res.status(400).json({ error: "immutable", message: "Published publications cannot be edited" });
+
+    const allowed = ["title", "description", "privacy", "status"];
+    const ALLOWED_EDIT_STATUSES = new Set(["draft", "pending"]);
+    const ALLOWED_PRIVACY = new Set(["public", "private", "unlisted"]);
+    const updates = {};
+    for (const k of allowed) {
+      if (req.body[k] === undefined) continue;
+      if (k === "status" && !ALLOWED_EDIT_STATUSES.has(req.body[k])) return res.status(400).json({ error: "bad_request", message: "status can only be set to: draft, pending" });
+      if (k === "privacy" && !ALLOWED_PRIVACY.has(req.body[k])) return res.status(400).json({ error: "bad_request", message: "privacy must be: public, private, or unlisted" });
+      updates[k] = req.body[k];
+    }
+    if (!Object.keys(updates).length) return res.status(400).json({ error: "bad_request", message: "No updatable fields provided" });
+
+    updates.updated_at = new Date();
+    const setClause = Object.keys(updates).map((k, i) => `${k}=$${i + 2}`).join(",");
+    const vals = [req.params.id, ...Object.values(updates)];
+    const [updated] = await query(`UPDATE sl_publications SET ${setClause} WHERE id=$1 RETURNING *`, vals);
+    res.json({ publication: formatPublication(updated) });
+  } catch (e) { res.status(500).json({ error: "server_error", message: e.message }); }
+});
+
+// DELETE /v1/publications/:id — delete a publication record
+app.delete("/v1/publications/:id", requireApiKey, async (req, res) => {
+  try {
+    const rows = await query("SELECT id FROM sl_publications WHERE id=$1 AND user_id=$2", [req.params.id, req.apiUserId]);
+    if (!rows[0]) return res.status(404).json({ error: "not_found", message: "Publication not found" });
+    await query("DELETE FROM sl_publications WHERE id=$1 AND user_id=$2", [req.params.id, req.apiUserId]);
+    res.json({ ok: true, message: "Publication deleted" });
+  } catch (e) { res.status(500).json({ error: "server_error", message: e.message }); }
 });
 
 // ============= DOCUMENTATION PAGE =============
@@ -1387,7 +1575,13 @@ app.get("/docs", (req, res) => {
       <div class="docs-nav-section">Endpoints</div>
       <a href="#list-profiles" class="docs-nav-link">List profiles</a>
       <a href="#get-profile" class="docs-nav-link">Get profile</a>
-      <a href="#publish" class="docs-nav-link">Publish video</a>
+      <a href="#publish" class="docs-nav-link">Publish video (legacy)</a>
+      <div class="docs-nav-section">Publications</div>
+      <a href="#pub-list" class="docs-nav-link">List publications</a>
+      <a href="#pub-create" class="docs-nav-link">Create publication</a>
+      <a href="#pub-get" class="docs-nav-link">Get publication</a>
+      <a href="#pub-update" class="docs-nav-link">Update publication</a>
+      <a href="#pub-delete" class="docs-nav-link">Delete publication</a>
       <div class="docs-nav-section">Examples</div>
       <a href="#ex-curl" class="docs-nav-link">cURL</a>
       <a href="#ex-js" class="docs-nav-link">JavaScript</a>
@@ -1529,6 +1723,149 @@ app.get("/docs", (req, res) => {
             <svg width="16" height="16" fill="none" stroke="#A7DDFF" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
             Storyload is currently in <strong>TikTok Sandbox mode</strong>. Published videos are visible only to your TikTok test account and won't appear publicly until production API access is approved.
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PUBLICATIONS: List -->
+    <div class="docs-section" id="pub-list">
+      <h2 class="docs-h2">List publications</h2>
+      <p class="docs-p">Returns all your publications with optional filters. Results are sorted newest first (max 100 per page).</p>
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method get">GET</span>
+          <span class="endpoint-path">/v1/publications</span>
+          <span class="endpoint-desc">Query params optional</span>
+        </div>
+        <div class="endpoint-body">
+          <div class="docs-h3">Query parameters</div>
+          <table class="param-table">
+            <thead><tr><th>Param</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td>profile_id<span class="opt">opt</span></td><td>string</td><td>Filter by profile UUID</td></tr>
+              <tr><td>platform<span class="opt">opt</span></td><td>string</td><td><code>youtube</code> or <code>tiktok</code></td></tr>
+              <tr><td>status<span class="opt">opt</span></td><td>string</td><td><code>pending</code> · <code>processing</code> · <code>published</code> · <code>failed</code></td></tr>
+              <tr><td>limit<span class="opt">opt</span></td><td>integer</td><td>1–100, default <code>20</code></td></tr>
+              <tr><td>offset<span class="opt">opt</span></td><td>integer</td><td>Pagination offset, default <code>0</code></td></tr>
+            </tbody>
+          </table>
+          <div class="docs-h3">Response</div>
+          <div class="resp-block"><pre>{
+  <span class="hl-key">"publications"</span>: [ <span class="hl-comment">/* Publication objects */</span> ],
+  <span class="hl-key">"total"</span>: <span class="hl-num">42</span>,
+  <span class="hl-key">"limit"</span>: <span class="hl-num">20</span>,
+  <span class="hl-key">"offset"</span>: <span class="hl-num">0</span>
+}</pre></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PUBLICATIONS: Create -->
+    <div class="docs-section" id="pub-create">
+      <h2 class="docs-h2">Create publication</h2>
+      <p class="docs-p">Create a new publication and immediately publish it to the connected channel. Use <code>status=draft</code> to save metadata without uploading a video yet.</p>
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method post">POST</span>
+          <span class="endpoint-path">/v1/publications</span>
+          <span class="endpoint-desc">multipart/form-data</span>
+        </div>
+        <div class="endpoint-body">
+          <div class="docs-h3">Body fields</div>
+          <table class="param-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td>platform<span class="req">*</span></td><td>string</td><td><code>youtube</code> or <code>tiktok</code></td></tr>
+              <tr><td>video<span class="req">*</span></td><td>file</td><td>Video file (mp4 recommended). Required unless <code>status=draft</code></td></tr>
+              <tr><td>title<span class="opt">opt</span></td><td>string</td><td>Title (max 100 chars for YouTube, 150 for TikTok)</td></tr>
+              <tr><td>description<span class="opt">opt</span></td><td>string</td><td>Description (YouTube only, max 5000 chars)</td></tr>
+              <tr><td>privacy<span class="opt">opt</span></td><td>string</td><td>YouTube: <code>public</code> · <code>private</code> · <code>unlisted</code>. Default: <code>private</code></td></tr>
+              <tr><td>profile_id<span class="opt">opt</span></td><td>string</td><td>Profile UUID. Omit to use the default channel</td></tr>
+              <tr><td>status<span class="opt">opt</span></td><td>string</td><td><code>published</code> (default) or <code>draft</code></td></tr>
+            </tbody>
+          </table>
+          <div class="docs-h3">Response — 201 Created</div>
+          <div class="resp-block"><pre>{
+  <span class="hl-key">"publication"</span>: {
+    <span class="hl-key">"id"</span>: <span class="hl-str">"9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"</span>,
+    <span class="hl-key">"profile_id"</span>: <span class="hl-str">"abc123"</span>,
+    <span class="hl-key">"platform"</span>: <span class="hl-str">"youtube"</span>,
+    <span class="hl-key">"status"</span>: <span class="hl-str">"published"</span>,
+    <span class="hl-key">"title"</span>: <span class="hl-str">"My Short"</span>,
+    <span class="hl-key">"description"</span>: <span class="hl-str">"Subscribe for more!"</span>,
+    <span class="hl-key">"privacy"</span>: <span class="hl-str">"public"</span>,
+    <span class="hl-key">"video_id"</span>: <span class="hl-str">"dQw4w9WgXcQ"</span>,
+    <span class="hl-key">"video_url"</span>: <span class="hl-str">"https://www.youtube.com/watch?v=dQw4w9WgXcQ"</span>,
+    <span class="hl-key">"publish_id"</span>: <span class="hl-str">null</span>,
+    <span class="hl-key">"error_message"</span>: <span class="hl-str">null</span>,
+    <span class="hl-key">"scheduled_at"</span>: <span class="hl-str">null</span>,
+    <span class="hl-key">"published_at"</span>: <span class="hl-str">"2026-03-30T12:00:00.000Z"</span>,
+    <span class="hl-key">"created_at"</span>: <span class="hl-str">"2026-03-30T12:00:00.000Z"</span>,
+    <span class="hl-key">"updated_at"</span>: <span class="hl-str">"2026-03-30T12:00:00.000Z"</span>,
+    <span class="hl-key">"meta"</span>: {}
+  }
+}</pre></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PUBLICATIONS: Get single -->
+    <div class="docs-section" id="pub-get">
+      <h2 class="docs-h2">Get publication</h2>
+      <p class="docs-p">Retrieve a single publication by its ID.</p>
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method get">GET</span>
+          <span class="endpoint-path">/v1/publications/:id</span>
+          <span class="endpoint-desc">No request body</span>
+        </div>
+        <div class="endpoint-body">
+          <div class="docs-h3">Response</div>
+          <div class="resp-block"><pre>{ <span class="hl-key">"publication"</span>: { <span class="hl-comment">/* Publication object */</span> } }</pre></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PUBLICATIONS: Update -->
+    <div class="docs-section" id="pub-update">
+      <h2 class="docs-h2">Update publication</h2>
+      <p class="docs-p">Update editable fields on a publication. Only <code>draft</code> or <code>pending</code> publications can be updated — published ones are immutable.</p>
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method" style="background:rgba(251,191,36,.12);color:#fbbf24">PATCH</span>
+          <span class="endpoint-path">/v1/publications/:id</span>
+          <span class="endpoint-desc">application/json</span>
+        </div>
+        <div class="endpoint-body">
+          <div class="docs-h3">Body fields</div>
+          <table class="param-table">
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+              <tr><td>title<span class="opt">opt</span></td><td>string</td><td>Update the title</td></tr>
+              <tr><td>description<span class="opt">opt</span></td><td>string</td><td>Update the description</td></tr>
+              <tr><td>privacy<span class="opt">opt</span></td><td>string</td><td><code>public</code> · <code>private</code> · <code>unlisted</code></td></tr>
+              <tr><td>status<span class="opt">opt</span></td><td>string</td><td><code>draft</code> or <code>pending</code></td></tr>
+            </tbody>
+          </table>
+          <div class="docs-h3">Response</div>
+          <div class="resp-block"><pre>{ <span class="hl-key">"publication"</span>: { <span class="hl-comment">/* Updated publication object */</span> } }</pre></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- PUBLICATIONS: Delete -->
+    <div class="docs-section" id="pub-delete">
+      <h2 class="docs-h2">Delete publication</h2>
+      <p class="docs-p">Delete a publication record. This removes the record from Storyload only — the video on YouTube or TikTok is not affected.</p>
+      <div class="endpoint">
+        <div class="endpoint-head">
+          <span class="method" style="background:rgba(248,113,113,.12);color:#f87171">DELETE</span>
+          <span class="endpoint-path">/v1/publications/:id</span>
+          <span class="endpoint-desc">No request body</span>
+        </div>
+        <div class="endpoint-body">
+          <div class="docs-h3">Response</div>
+          <div class="resp-block"><pre>{ <span class="hl-key">"ok"</span>: <span class="hl-num">true</span>, <span class="hl-key">"message"</span>: <span class="hl-str">"Publication deleted"</span> }</pre></div>
         </div>
       </div>
     </div>
