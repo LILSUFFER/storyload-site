@@ -138,12 +138,7 @@ function avatarColor(name) {
 
 // ============= HTML Templates =============
 
-const LOGO_SVG = `<svg width="30" height="30" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect x="13" y="0" width="4" height="13" fill="#A7DDFF"/>
-  <rect x="13" y="17" width="4" height="13" fill="#A7DDFF"/>
-  <rect x="0" y="13" width="13" height="4" fill="#A7DDFF"/>
-  <rect x="17" y="13" width="13" height="4" fill="#A7DDFF"/>
-</svg>`;
+const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="102" height="28" fill="none" viewBox="0 0 100 28"><path fill="#34D59A" d="M27.542.008V28l-10.747-9.508v9.323H0V0zM3.376 24.439H13.42V11.084l10.747 9.508V3.382l-20.79-.005z"/><path fill="#fff" d="m49.97 23.124-10.745-9.51v9.323h-3.38V6.201l10.746 9.51V6.387h3.38zm3.722-.187V6.387h10.116V9.72h-6.736v3.264h5.338v3.263h-5.338v3.357h6.736v3.333zm20.58.187a8.446 8.446 0 0 1-8.461-8.462 8.446 8.446 0 0 1 8.46-8.461 8.446 8.446 0 0 1 8.462 8.461 8.446 8.446 0 0 1-8.461 8.462m0-3.264c2.89 0 5.058-2.33 5.058-5.198 0-2.867-2.168-5.198-5.058-5.198s-5.058 2.331-5.058 5.198 2.168 5.198 5.058 5.198m24.888 3.264-10.746-9.51v9.323h-3.38V6.201l10.746 9.51V6.387h3.38z"/></svg>`;
 
 function layout(title, content, user) {
   return `<!DOCTYPE html>
@@ -151,9 +146,6 @@ function layout(title, content, user) {
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${title} — Storyload</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
 <link rel="icon" href="/storyload-logo.svg" type="image/svg+xml">
 </head>
@@ -162,7 +154,6 @@ function layout(title, content, user) {
   <div class="header-inner">
     <a href="/" class="logo-link">
       ${LOGO_SVG}
-      <span class="logo-text">Storyload</span>
     </a>
     <nav class="header-nav">
       <a href="/about">About</a>
@@ -1136,7 +1127,6 @@ app.get("/docs", (req, res) => {
   <div class="header-inner">
     <a href="/" class="logo-link">
       ${LOGO_SVG}
-      <span class="logo-text">Storyload</span>
     </a>
     <nav class="header-nav">
       <a href="/dashboard">Dashboard</a>
