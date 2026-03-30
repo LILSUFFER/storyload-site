@@ -1,0 +1,21 @@
+{
+  "name": "storyload-app",
+  "version": "1.0.0",
+  "description": "Storyload — video publishing platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "connect-pg-simple": "^10.0.0",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "googleapis": "^144.0.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

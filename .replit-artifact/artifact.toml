@@ -1,0 +1,15 @@
+kind = "web"
+  previewPath = "/"
+  title = "StoryLoad Site"
+  version = "1.0.0"
+
+  [[services]]
+  localPort = 3001
+  name = "StoryLoad Site"
+  paths = ["/"]
+
+  [services.development]
+  run = "PORT=3001 node server.js"
+
+  [services.production]
+  run = "node server.js"
