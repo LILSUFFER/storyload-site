@@ -90,6 +90,44 @@ async function requireApiKey(req, res, next) {
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
+// Security headers
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "SAMEORIGIN");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  res.setHeader("Content-Security-Policy",
+    "default-src 'self'; " +
+    "script-src 'self' 'unsafe-inline'; " +
+    "style-src 'self' 'unsafe-inline'; " +
+    "img-src 'self' data: https://p16-sign-va.tiktokcdn.com https://p19-sign.tiktokcdn-us.com https://yt3.ggpht.com https://lh3.googleusercontent.com https://*.googleusercontent.com https://*.tiktokcdn.com https://*.tiktokcdn-us.com; " +
+    "font-src 'self'; " +
+    "connect-src 'self'; " +
+    "frame-ancestors 'none';"
+  );
+  next();
+});
+
+// robots.txt
+app.get("/robots.txt", (req, res) => {
+  res.type("text/plain");
+  res.send("User-agent: *\nAllow: /\nDisallow: /dashboard\nDisallow: /account\nDisallow: /api\nDisallow: /auth\nSitemap: https://storyload.ru/sitemap.xml\n");
+});
+
+// sitemap.xml
+app.get("/sitemap.xml", (req, res) => {
+  res.type("application/xml");
+  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://storyload.ru/</loc><changefreq>monthly</changefreq><priority>1.0</priority></url>
+  <url><loc>https://storyload.ru/about</loc><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://storyload.ru/privacy</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://storyload.ru/terms</loc><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://storyload.ru/docs</loc><changefreq>monthly</changefreq><priority>0.6</priority></url>
+</urlset>`);
+});
+
 app.use(express.static(path.join(__dirname, "public")));
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
@@ -138,7 +176,7 @@ function avatarColor(name) {
 
 // ============= HTML Templates =============
 
-const LOGO_SVG = `<svg xmlns="http://www.w3.org/2000/svg" width="102" height="28" fill="none" viewBox="0 0 100 28"><path fill="#34D59A" d="M27.542.008V28l-10.747-9.508v9.323H0V0zM3.376 24.439H13.42V11.084l10.747 9.508V3.382l-20.79-.005z"/><path fill="#fff" d="m49.97 23.124-10.745-9.51v9.323h-3.38V6.201l10.746 9.51V6.387h3.38zm3.722-.187V6.387h10.116V9.72h-6.736v3.264h5.338v3.263h-5.338v3.357h6.736v3.333zm20.58.187a8.446 8.446 0 0 1-8.461-8.462 8.446 8.446 0 0 1 8.46-8.461 8.446 8.446 0 0 1 8.462 8.461 8.446 8.446 0 0 1-8.461 8.462m0-3.264c2.89 0 5.058-2.33 5.058-5.198 0-2.867-2.168-5.198-5.058-5.198s-5.058 2.331-5.058 5.198 2.168 5.198 5.058 5.198m24.888 3.264-10.746-9.51v9.323h-3.38V6.201l10.746 9.51V6.387h3.38z"/></svg>`;
+const LOGO_SVG = `<img src="/logo.svg" alt="Storyload" style="height:52px;width:auto;display:block;">`;
 
 function layout(title, content, user) {
   return `<!DOCTYPE html>
@@ -311,9 +349,17 @@ app.get("/auth/google", (req, res) => {
 });
 
 app.get("/auth/google/callback", async (req, res) => {
+  // Harden: no session state = reject immediately (prevents Safe Browsing crawler false-positive)
+  const expectedState = req.session.oauthState;
+  if (!expectedState) return res.redirect("/login");
+  // Only extract code and state — ignore all other params (iss, scope, etc.)
+  const code = typeof req.query.code === "string" ? req.query.code : "";
+  const state = typeof req.query.state === "string" ? req.query.state : "";
+  // Constant-time state comparison + clear after use to prevent replay
+  const stateMatch = crypto.timingSafeEqual(Buffer.from(state.padEnd(64, "0")), Buffer.from(expectedState.padEnd(64, "0")));
+  req.session.oauthState = null;
+  if (!code || !stateMatch) return res.redirect("/login?error=state");
   try {
-    const { code, state } = req.query;
-    if (!code || state !== req.session.oauthState) return res.redirect("/login?error=state");
     const client = getGoogleClient(`${APP_URL}/auth/google/callback`);
     const { tokens } = await client.getToken(code);
     client.setCredentials(tokens);
@@ -334,7 +380,7 @@ app.get("/auth/google/callback", async (req, res) => {
     }
     req.session.userId = user.id;
     res.redirect("/dashboard");
-  } catch (e) { console.error(e); res.redirect("/login?error=auth"); }
+  } catch (e) { console.error("[google-cb]", e.message); res.redirect("/login?error=auth"); }
 });
 
 // TikTok OAuth — per profile
@@ -356,10 +402,17 @@ app.get("/auth/tiktok", requireAuth, (req, res) => {
 app.get("/auth/tiktok/callback", async (req, res) => {
   const profileId = req.session.oauthProfileId || null;
   const back = profileId ? `/profiles/${profileId}` : "/dashboard";
+  const expectedTT = req.session.oauthState;
+  const ttCode = typeof req.query.code === "string" ? req.query.code : "";
+  const ttState = typeof req.query.state === "string" ? req.query.state : "";
+  const ttErr = typeof req.query.error === "string" ? req.query.error : "";
+  if (!expectedTT || !req.session.userId) return res.redirect("/login");
+  const ttMatch = expectedTT.length === ttState.length && crypto.timingSafeEqual(Buffer.from(ttState), Buffer.from(expectedTT));
+  req.session.oauthState = null;
   try {
-    const { code, state, error } = req.query;
-    if (error) return res.redirect(`${back}?error=${encodeURIComponent(error)}`);
-    if (!code || state !== req.session.oauthState || !req.session.userId) return res.redirect(`${back}?error=state`);
+    if (ttErr) return res.redirect(`${back}?error=${encodeURIComponent(ttErr)}`);
+    if (!ttCode || !ttMatch) return res.redirect(`${back}?error=state`);
+    const code = ttCode;
 
     const tokenRes = await fetch("https://open.tiktokapis.com/v2/oauth/token/", {
       method: "POST",
@@ -403,10 +456,17 @@ app.get("/auth/youtube", requireAuth, (req, res) => {
 app.get("/auth/youtube/callback", async (req, res) => {
   const profileId = req.session.oauthProfileId || null;
   const back = profileId ? `/profiles/${profileId}` : "/dashboard";
+  const expectedYT = req.session.oauthState;
+  const ytCode = typeof req.query.code === "string" ? req.query.code : "";
+  const ytState = typeof req.query.state === "string" ? req.query.state : "";
+  const ytErr = typeof req.query.error === "string" ? req.query.error : "";
+  if (!expectedYT || !req.session.userId) return res.redirect("/login");
+  const ytMatch = expectedYT.length === ytState.length && crypto.timingSafeEqual(Buffer.from(ytState), Buffer.from(expectedYT));
+  req.session.oauthState = null;
   try {
-    const { code, state, error } = req.query;
-    if (error) return res.redirect(`${back}?error=${encodeURIComponent(error)}`);
-    if (!code || state !== req.session.oauthState || !req.session.userId) return res.redirect(`${back}?error=state`);
+    if (ytErr) return res.redirect(`${back}?error=${encodeURIComponent(ytErr)}`);
+    if (!ytCode || !ytMatch) return res.redirect(`${back}?error=state`);
+    const code = ytCode;
     const client = getGoogleClient(`${APP_URL}/auth/youtube/callback`);
     const { tokens } = await client.getToken(code);
     client.setCredentials(tokens);
@@ -779,7 +839,8 @@ app.post("/api/publish", requireAuth, upload.single("video"), async (req, res) =
 
     if (platform === "tiktok") {
       const fileSize = req.file.size;
-      const chunkSize = 10 * 1024 * 1024;
+      const TARGET_CHUNK = 10 * 1024 * 1024;
+      const chunkSize = fileSize <= TARGET_CHUNK ? fileSize : TARGET_CHUNK;
       const totalChunks = Math.ceil(fileSize / chunkSize);
       const safeTitle = (title || req.file.originalname || "My video").substring(0, 150);
 
@@ -792,9 +853,16 @@ app.post("/api/publish", requireAuth, upload.single("video"), async (req, res) =
         }),
       });
       const initData = await initRes.json();
+      console.log("[tiktok-init] response:", JSON.stringify(initData));
       if (initData.error?.code !== "ok") {
         fs.unlinkSync(req.file.path);
-        return res.status(400).json({ error: initData.error?.message || "TikTok init failed", raw: initData });
+        const errCode = initData.error?.code || "unknown";
+        const errMsg = initData.error?.message || "TikTok init failed";
+        let hint = "";
+        if (errCode === "access_token_invalid" || errCode === "scope_not_authorized") {
+          hint = " Try disconnecting and reconnecting your TikTok account to refresh the token.";
+        }
+        return res.status(400).json({ error: `[${errCode}] ${errMsg}${hint}`, raw: initData });
       }
 
       const { publish_id, upload_url } = initData.data;
@@ -803,11 +871,12 @@ app.post("/api/publish", requireAuth, upload.single("video"), async (req, res) =
       for (let i = 0; i < totalChunks; i++) {
         const chunk = fileBuffer.slice(offset, offset + chunkSize);
         const end = Math.min(offset + chunkSize - 1, fileSize - 1);
-        await fetch(upload_url, {
+        const uploadRes = await fetch(upload_url, {
           method: "PUT",
           headers: { "Content-Type": "video/mp4", "Content-Range": `bytes ${offset}-${end}/${fileSize}`, "Content-Length": String(chunk.length) },
           body: chunk,
         });
+        console.log(`[tiktok-chunk] ${i+1}/${totalChunks} status=${uploadRes.status}`);
         offset += chunkSize;
       }
       fs.unlinkSync(req.file.path);
@@ -874,20 +943,97 @@ app.get("/about", (req, res) => {
   res.send(layout("About Storyload", `
   <div class="page-wrap"><div class="page-content narrow text-page">
     <h1>About Storyload</h1>
-    <p>Storyload is a web-based video publishing platform for content creators who want to manage multiple TikTok and YouTube projects from one dashboard.</p>
-    <h2>What Storyload does</h2>
+    <p>Storyload is a video publishing platform built for content creators, agencies, and social media managers who need to publish videos to multiple accounts efficiently.</p>
+
+    <h2>What is Storyload?</h2>
+    <p>Storyload is a legitimate web service that allows you to manage multiple TikTok and YouTube accounts from a single dashboard. We use only official APIs provided by TikTok and Google — we never ask for your social media passwords.</p>
+
+    <h2>How it works</h2>
     <ul class="legal-list">
-      <li>Sign in once with Google</li>
-      <li>Create up to 100 profile cards — each is a separate brand or project</li>
-      <li>Connect a TikTok and YouTube channel to each profile</li>
-      <li>Upload and publish videos via official APIs</li>
+      <li><strong>Sign in with your Google account</strong> — we use Google OAuth 2.0, the same secure login used by millions of apps</li>
+      <li><strong>Create profile cards</strong> — each profile represents a separate brand, channel, or project (up to 100 profiles)</li>
+      <li><strong>Connect your channels</strong> — authorize TikTok and YouTube access using their official OAuth flows</li>
+      <li><strong>Upload and publish</strong> — upload a video file and publish it to connected channels with one click</li>
     </ul>
+
+    <h2>Why we ask for Google login</h2>
+    <p>We use Google Sign-In (<code>accounts.google.com</code>) only to create and authenticate your Storyload account. We do not request access to your Gmail, Google Drive, or any other Google services unless you explicitly connect a YouTube channel.</p>
+
     <h2>Our use of TikTok API</h2>
-    <p>We use the TikTok Content Posting API. We request only: <code>user.info.basic</code>, <code>video.upload</code>, <code>video.publish</code>. Currently in Sandbox mode.</p>
+    <p>We use the official <strong>TikTok Content Posting API</strong>. When you click "Connect TikTok", you are redirected to TikTok's own authorization page at <code>open.tiktokapis.com</code>. We request only three scopes:</p>
+    <ul class="legal-list">
+      <li><code>user.info.basic</code> — to display your TikTok username and avatar</li>
+      <li><code>video.upload</code> — to upload video files to TikTok</li>
+      <li><code>video.publish</code> — to publish the uploaded video to your profile</li>
+    </ul>
+    <p>We never store your TikTok password. Access can be revoked at any time from your TikTok account settings.</p>
+
     <h2>Our use of YouTube API</h2>
-    <p>We use YouTube Data API v3 with <code>youtube.upload</code> and <code>youtube.readonly</code> scopes.</p>
+    <p>We use <strong>YouTube Data API v3</strong> provided by Google. When you connect a YouTube channel, you authorize us via Google's secure OAuth 2.0 flow. We only request permission to upload videos on your behalf. You can revoke access at <a href="https://security.google.com/settings/security/permissions" target="_blank" rel="noopener noreferrer">Google Account permissions</a>.</p>
+
+    <h2>Data we store</h2>
+    <ul class="legal-list">
+      <li>Your name and email (from Google login)</li>
+      <li>Your profile cards and their names</li>
+      <li>OAuth access tokens for connected TikTok and YouTube channels (encrypted in our database)</li>
+    </ul>
+    <p>We do not sell, share, or transfer your data to third parties. Full details are in our <a href="/privacy">Privacy Policy</a>.</p>
+
     <h2>Contact</h2>
-    <p><a href="mailto:support@storyload.ru">support@storyload.ru</a></p>
+    <p>Questions or concerns? Email us: <a href="mailto:support@storyload.ru">support@storyload.ru</a></p>
+    <p>Storyload is operated by an independent developer. This is not affiliated with TikTok, YouTube, or Google.</p>
+  </div></div>
+  `));
+});
+
+app.get("/terms", (req, res) => {
+  res.send(layout("Terms of Service — Storyload", `
+  <div class="page-wrap"><div class="page-content narrow text-page">
+    <h1>Terms of Service</h1>
+    <p><em>Last updated: March 30, 2026</em></p>
+    <p>By using Storyload ("the Service", available at storyload.ru), you agree to these Terms of Service. Please read them carefully.</p>
+
+    <h2>1. Description of Service</h2>
+    <p>Storyload is a video publishing platform that lets you upload and publish videos to TikTok and YouTube via their official APIs. The Service is provided as-is for content creators, social media managers, and developers.</p>
+
+    <h2>2. Account Registration</h2>
+    <p>You must sign in using a Google account to use Storyload. You are responsible for maintaining the security of your account and all activity under it. You must be at least 13 years old to use this Service.</p>
+
+    <h2>3. Acceptable Use</h2>
+    <p>You agree to use Storyload only for lawful purposes. You must not use the Service to:</p>
+    <ul class="legal-list">
+      <li>Publish content that violates TikTok's or YouTube's Terms of Service</li>
+      <li>Upload content that is illegal, harmful, or infringes on third-party rights</li>
+      <li>Attempt to reverse-engineer, abuse, or overload the Service</li>
+      <li>Use the Service to spam, harass, or deceive other users</li>
+    </ul>
+
+    <h2>4. Third-Party Services</h2>
+    <p>Storyload integrates with TikTok and YouTube using their official APIs. Your use of those platforms is governed by their own terms:</p>
+    <ul class="legal-list">
+      <li><a href="https://www.tiktok.com/legal/terms-of-service" target="_blank" rel="noopener noreferrer">TikTok Terms of Service</a></li>
+      <li><a href="https://www.youtube.com/t/terms" target="_blank" rel="noopener noreferrer">YouTube Terms of Service</a></li>
+      <li><a href="https://policies.google.com/terms" target="_blank" rel="noopener noreferrer">Google Terms of Service</a></li>
+    </ul>
+    <p>Storyload is not affiliated with, endorsed by, or sponsored by TikTok, YouTube, or Google.</p>
+
+    <h2>5. API Keys</h2>
+    <p>If you generate Storyload API keys, you are responsible for keeping them confidential. Do not share API keys in public repositories or with untrusted parties. We reserve the right to revoke keys that are used abusively.</p>
+
+    <h2>6. Data and Privacy</h2>
+    <p>We collect and process your data as described in our <a href="/privacy">Privacy Policy</a>. We do not sell your data to third parties.</p>
+
+    <h2>7. Disclaimer of Warranties</h2>
+    <p>The Service is provided "as is" without warranties of any kind. We do not guarantee uninterrupted access, and we are not liable for any loss resulting from service downtime, API changes by TikTok or YouTube, or other events outside our control.</p>
+
+    <h2>8. Limitation of Liability</h2>
+    <p>To the maximum extent permitted by law, Storyload and its operators shall not be liable for any indirect, incidental, or consequential damages arising from your use of the Service.</p>
+
+    <h2>9. Changes to Terms</h2>
+    <p>We may update these Terms from time to time. Continued use of the Service after changes constitutes acceptance of the new Terms.</p>
+
+    <h2>10. Contact</h2>
+    <p>Questions about these Terms: <a href="mailto:support@storyload.ru">support@storyload.ru</a></p>
   </div></div>
   `));
 });
@@ -1020,7 +1166,8 @@ app.post("/v1/profiles/:id/publish", requireApiKey, upload.single("video"), asyn
 
     if (platform === "tiktok") {
       const fileSize = req.file.size;
-      const chunkSize = 10 * 1024 * 1024;
+      const TARGET_CHUNK = 10 * 1024 * 1024;
+      const chunkSize = fileSize <= TARGET_CHUNK ? fileSize : TARGET_CHUNK;
       const totalChunks = Math.ceil(fileSize / chunkSize);
       const safeTitle = (title || req.file.originalname || "My video").substring(0, 150);
 
