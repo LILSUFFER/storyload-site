@@ -831,6 +831,18 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
         <label>Video title</label>
         <input type="text" name="title" placeholder="Enter video title..." maxlength="150">
       </div>
+      <div class="form-group youtube-only" id="desc-group" style="display:none">
+        <label>Description <span style="font-weight:400;color:#888">(YouTube)</span></label>
+        <textarea name="description" rows="3" maxlength="5000" placeholder="Optional description..." style="width:100%;resize:vertical;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:#fff;font-size:14px;font-family:inherit"></textarea>
+      </div>
+      <div class="form-group youtube-only" id="privacy-group" style="display:none">
+        <label>Privacy <span style="font-weight:400;color:#888">(YouTube)</span></label>
+        <select name="privacy" id="privacy-select">
+          <option value="private">Private — only you can see it</option>
+          <option value="unlisted">Unlisted — anyone with the link</option>
+          <option value="public">Public — visible to everyone</option>
+        </select>
+      </div>
       <div class="form-group">
         <label>Video file</label>
         <div class="dropzone" id="dropzone" onclick="document.getElementById('video-input').click()">
@@ -843,11 +855,11 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
         </div>
       </div>
       <div id="progress-wrap" style="display:none">
-        <div class="progress-label"><span>Uploading...</span><span id="progress-pct">0%</span></div>
+        <div class="progress-label"><span id="progress-label-text">Uploading...</span><span id="progress-pct">0%</span></div>
         <div class="progress-bar"><div id="progress-fill"></div></div>
       </div>
       <button type="submit" class="btn-primary full" id="submit-btn">Publish Video</button>
-      <p class="terms-note">By publishing you agree to <a href="https://www.tiktok.com/legal/page/global/terms-of-service/en" target="_blank">TikTok's Terms of Service</a></p>
+      <p class="terms-note" id="terms-note">By publishing you agree to the platform's Terms of Service</p>
     </form>
   </div>
   <script src="/publish.js"></script>
@@ -916,6 +928,53 @@ app.post("/api/publish", requireAuth, upload.single("video"), async (req, res) =
       }
       fs.unlinkSync(req.file.path);
       return res.json({ ok: true, publishId: publish_id, platform: "tiktok", message: "Video uploaded to TikTok for processing" });
+    }
+
+    if (platform === "youtube") {
+      const ytClient = getGoogleClient(`${APP_URL}/auth/youtube/callback`);
+      ytClient.setCredentials({
+        access_token: ch.access_token,
+        refresh_token: ch.refresh_token || undefined,
+        expiry_date: ch.expires_at ? Number(ch.expires_at) : undefined,
+      });
+      const yt = google.youtube({ version: "v3", auth: ytClient });
+
+      const safeTitle = (req.body.title || req.file.originalname || "My video").substring(0, 100);
+      const description = (req.body.description || "").substring(0, 5000);
+      const allowedPrivacy = new Set(["public", "private", "unlisted"]);
+      const privacy = allowedPrivacy.has(req.body.privacy) ? req.body.privacy : "private";
+
+      console.log(`[youtube-upload] title="${safeTitle}" privacy=${privacy} size=${req.file.size}`);
+
+      const response = await yt.videos.insert({
+        part: ["snippet", "status"],
+        requestBody: {
+          snippet: {
+            title: safeTitle,
+            description,
+            categoryId: "22",
+          },
+          status: {
+            privacyStatus: privacy,
+            selfDeclaredMadeForKids: false,
+          },
+        },
+        media: { body: fs.createReadStream(req.file.path) },
+      });
+
+      fs.unlinkSync(req.file.path);
+      const videoId = response.data.id;
+      const privacyStatus = response.data.status?.privacyStatus || privacy;
+      console.log(`[youtube-upload] done videoId=${videoId}`);
+      return res.json({
+        ok: true,
+        platform: "youtube",
+        videoId,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        title: response.data.snippet?.title || safeTitle,
+        privacyStatus,
+        message: "Video published to YouTube",
+      });
     }
 
     fs.unlinkSync(req.file.path);
