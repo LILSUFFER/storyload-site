@@ -18,6 +18,21 @@ const GOOGLE_CLIENT_SECRET = process.env.GOOG_CLIENT_SECRET || process.env.GOOGL
 const TIKTOK_CLIENT_KEY = process.env.TIKTOK_CLIENT_KEY || "";
 const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
 
+// ── Auth security ─────────────────────────────────────────────────────────────
+// Allowlist of valid platform names for OAuth routes
+const ALLOWED_PLATFORMS = new Set(["tiktok", "youtube"]);
+// UUID v4 pattern — only accept this for profile_id params
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Returns a hardcoded internal redirect path — never trusts raw string from request
+function safeBack(profileId) {
+  if (profileId && UUID_RE.test(String(profileId))) return `/profiles/${profileId}`;
+  return "/dashboard";
+}
+// Validates a platform param against the allowlist
+function isValidPlatform(p) {
+  return typeof p === "string" && ALLOWED_PLATFORMS.has(p);
+}
+
 // DB — prefer Neon (external, 24/7) over Replit-managed DB
 const DB_URL = (process.env.NEON_DATABASE_URL || process.env.DATABASE_URL || "")
   .replace("sslmode=require", "sslmode=verify-full")
@@ -144,6 +159,14 @@ app.use(session({
 }));
 
 const upload = multer({ dest: uploadDir, limits: { fileSize: 500 * 1024 * 1024 } });
+
+// All /auth/* routes: no caching, no indexing — prevents Safe Browsing from scanning auth URLs
+app.use("/auth", (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  next();
+});
 
 function getGoogleClient(redirectUri) {
   return new google.auth.OAuth2(GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, redirectUri);
@@ -385,7 +408,8 @@ app.get("/auth/google/callback", async (req, res) => {
 
 // TikTok OAuth — per profile
 app.get("/auth/tiktok", requireAuth, (req, res) => {
-  const profileId = req.query.profile_id || "";
+  const raw = req.query.profile_id;
+  const profileId = (typeof raw === "string" && UUID_RE.test(raw)) ? raw : "";
   const state = crypto.randomBytes(16).toString("hex");
   req.session.oauthState = state;
   req.session.oauthProfileId = profileId;
@@ -401,7 +425,7 @@ app.get("/auth/tiktok", requireAuth, (req, res) => {
 
 app.get("/auth/tiktok/callback", async (req, res) => {
   const profileId = req.session.oauthProfileId || null;
-  const back = profileId ? `/profiles/${profileId}` : "/dashboard";
+  const back = safeBack(profileId);
   const expectedTT = req.session.oauthState;
   const ttCode = typeof req.query.code === "string" ? req.query.code : "";
   const ttState = typeof req.query.state === "string" ? req.query.state : "";
@@ -444,7 +468,8 @@ app.get("/auth/tiktok/callback", async (req, res) => {
 
 // YouTube OAuth — per profile
 app.get("/auth/youtube", requireAuth, (req, res) => {
-  const profileId = req.query.profile_id || "";
+  const rawYT = req.query.profile_id;
+  const profileId = (typeof rawYT === "string" && UUID_RE.test(rawYT)) ? rawYT : "";
   const state = crypto.randomBytes(16).toString("hex");
   req.session.oauthState = state;
   req.session.oauthProfileId = profileId;
@@ -455,7 +480,7 @@ app.get("/auth/youtube", requireAuth, (req, res) => {
 
 app.get("/auth/youtube/callback", async (req, res) => {
   const profileId = req.session.oauthProfileId || null;
-  const back = profileId ? `/profiles/${profileId}` : "/dashboard";
+  const back = safeBack(profileId);
   const expectedYT = req.session.oauthState;
   const ytCode = typeof req.query.code === "string" ? req.query.code : "";
   const ytState = typeof req.query.state === "string" ? req.query.state : "";
@@ -491,12 +516,17 @@ app.get("/auth/youtube/callback", async (req, res) => {
 });
 
 app.get("/auth/disconnect/:platform", requireAuth, async (req, res) => {
-  const profileId = req.query.profile_id || null;
+  // Validate platform against strict allowlist — reject unknown values entirely
+  const platform = req.params.platform;
+  if (!isValidPlatform(platform)) return res.redirect("/dashboard");
+  // Validate profile_id as UUID — reject any other format (prevents path traversal + CRLF)
+  const rawPid = req.query.profile_id;
+  const profileId = (typeof rawPid === "string" && UUID_RE.test(rawPid)) ? rawPid : null;
   if (profileId) {
-    await query("DELETE FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id=$3", [req.session.userId, req.params.platform, profileId]);
+    await query("DELETE FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id=$3", [req.session.userId, platform, profileId]);
     return res.redirect(`/profiles/${profileId}`);
   }
-  await query("DELETE FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id IS NULL", [req.session.userId, req.params.platform]);
+  await query("DELETE FROM sl_user_channels WHERE user_id=$1 AND platform=$2 AND profile_id IS NULL", [req.session.userId, platform]);
   res.redirect("/dashboard");
 });
 
