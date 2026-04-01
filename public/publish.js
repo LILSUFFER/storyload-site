@@ -10,22 +10,6 @@
   var submitBtn = document.getElementById("submit-btn");
   var resultBox = document.getElementById("result-box");
   var platformSelect = document.getElementById("platform-select");
-  var termsNote = document.getElementById("terms-note");
-
-  var ytTerms = 'By publishing you agree to <a href="https://www.youtube.com/t/terms" target="_blank">YouTube\'s Terms of Service</a>';
-  var ttTerms = 'By publishing you agree to <a href="https://www.tiktok.com/legal/page/global/terms-of-service/en" target="_blank">TikTok\'s Terms of Service</a>';
-
-  function updatePlatformUI() {
-    var isYT = platformSelect.value === "youtube";
-    var ytFields = document.querySelectorAll(".youtube-only");
-    ytFields.forEach(function(el) { el.style.display = isYT ? "block" : "none"; });
-    termsNote.innerHTML = isYT ? ytTerms : ttTerms;
-  }
-
-  if (platformSelect) {
-    platformSelect.addEventListener("change", updatePlatformUI);
-    updatePlatformUI();
-  }
 
   function showFile(input) {
     var f = input.files[0];
@@ -51,11 +35,12 @@
     e.preventDefault();
     var file = dzInput.files[0];
     if (!file) { alert("Please select a video file."); return; }
-    var isYT = platformSelect.value === "youtube";
+    var platform = platformSelect.value;
+    var isYT = platform === "youtube";
     submitBtn.disabled = true;
     submitBtn.textContent = "Publishing...";
     progressWrap.style.display = "block";
-    progressLabel.textContent = isYT ? "Uploading to YouTube..." : "Uploading...";
+    progressLabel.textContent = isYT ? "Uploading to YouTube..." : "Uploading to TikTok...";
     resultBox.style.display = "none";
 
     var data = new FormData(form);
@@ -68,6 +53,7 @@
         progressFill.style.width = pct + "%";
         progressPct.textContent = pct + "%";
         if (isYT && pct >= 90) progressLabel.textContent = "Processing on YouTube...";
+        if (!isYT && pct >= 85) progressLabel.textContent = "Sending to TikTok...";
       }
     };
 
@@ -75,7 +61,7 @@
       progressFill.style.width = "100%";
       progressPct.textContent = "100%";
       submitBtn.disabled = false;
-      submitBtn.textContent = "Publish Video";
+      submitBtn.textContent = isYT ? "Publish to YouTube" : "Post to TikTok";
       var resp;
       try { resp = JSON.parse(xhr.responseText); } catch(err) { resp = { error: xhr.responseText }; }
       progressWrap.style.display = "none";
@@ -97,12 +83,18 @@
             '<a href="' + resp.url + '" target="_blank" rel="noopener" class="btn-primary" style="display:inline-block;margin-top:4px">▶ Open on YouTube</a>' +
             (resp.privacyStatus === "private" ? '<p style="margin-top:12px;font-size:12px;color:#888">Video is private — change visibility in YouTube Studio.</p>' : '') +
             '</div>';
+        } else if (resp.platform === "tiktok") {
+          resultBox.innerHTML =
+            '<div class="result-success">' +
+            '<h3>✓ Posted to TikTok!</h3>' +
+            '<p style="margin:8px 0">Your video was submitted to TikTok for processing. It will appear in your account shortly.</p>' +
+            (resp.publishId ? '<p><code style="background:rgba(255,255,255,.08);padding:2px 8px;border-radius:4px;font-size:12px">Publish ID: ' + resp.publishId + '</code></p>' : '') +
+            '<p style="margin-top:12px;font-size:12px;color:var(--muted)">Check your TikTok inbox — you\'ll get a notification when the upload is complete.</p>' +
+            '</div>';
         } else {
           resultBox.innerHTML =
             '<div class="result-success"><h3>✓ Video Published!</h3>' +
-            '<p>Your video has been submitted to TikTok for processing.</p>' +
-            (resp.publishId ? '<code>Publish ID: ' + resp.publishId + '</code>' : '') +
-            '<p style="margin-top:12px;font-size:12px;">Sandbox mode: visible only to your test account.</p></div>';
+            '<p>Your video has been submitted successfully.</p></div>';
         }
       } else {
         resultBox.innerHTML = '<div class="result-error"><p><strong>Error:</strong> ' + (resp.error || "Unknown error") + '</p></div>';
@@ -114,7 +106,7 @@
       resultBox.style.display = "block";
       resultBox.innerHTML = '<div class="result-error"><p>Network error. Please try again.</p></div>';
       submitBtn.disabled = false;
-      submitBtn.textContent = "Publish Video";
+      submitBtn.textContent = isYT ? "Publish to YouTube" : "Post to TikTok";
     };
     xhr.send(data);
   });

@@ -174,16 +174,42 @@ async function doPublishYouTube(ch, { title, description, privacy, filePath }) {
   };
 }
 
-async function doPublishTikTok(ch, { title, filePath, fileSize }) {
+async function fetchTikTokCreatorInfo(accessToken) {
+  const res = await fetch("https://open.tiktokapis.com/v2/post/publish/creator_info/query/", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json; charset=UTF-8" },
+    body: JSON.stringify({}),
+  });
+  const data = await res.json();
+  if (data.error?.code !== "ok") throw new Error(data.error?.message || "Failed to fetch creator info");
+  return data.data;
+}
+
+const PRIVACY_LABELS = {
+  PUBLIC_TO_EVERYONE: "Public — visible to everyone",
+  MUTUAL_FRIENDS_AND_FOLLOWERS: "Friends & Followers only",
+  FOLLOWER_OF_CREATOR: "Followers only",
+  SELF_ONLY: "Private — only me",
+};
+
+async function doPublishTikTok(ch, { title, filePath, fileSize, privacyLevel, disableDuet, disableStitch, disableComment }) {
   const TARGET_CHUNK = 10 * 1024 * 1024;
   const chunkSize = fileSize <= TARGET_CHUNK ? fileSize : TARGET_CHUNK;
   const totalChunks = Math.ceil(fileSize / chunkSize);
   const safeTitle = (title || "My video").substring(0, 150);
+  const safePrivacy = privacyLevel || "SELF_ONLY";
   const initRes = await fetch("https://open.tiktokapis.com/v2/post/publish/video/init/", {
     method: "POST",
     headers: { Authorization: `Bearer ${ch.access_token}`, "Content-Type": "application/json; charset=UTF-8" },
     body: JSON.stringify({
-      post_info: { title: safeTitle, privacy_level: "SELF_ONLY", disable_duet: false, disable_comment: false, disable_stitch: false, video_cover_timestamp_ms: 1000 },
+      post_info: {
+        title: safeTitle,
+        privacy_level: safePrivacy,
+        disable_duet: !!disableDuet,
+        disable_comment: !!disableComment,
+        disable_stitch: !!disableStitch,
+        video_cover_timestamp_ms: 1000,
+      },
       source_info: { source: "FILE_UPLOAD", video_size: fileSize, chunk_size: chunkSize, total_chunk_count: totalChunks },
     }),
   });
@@ -703,6 +729,34 @@ app.get("/auth/disconnect/:platform", requireAuth, async (req, res) => {
 
 app.get("/logout", (req, res) => { req.session.destroy(() => {}); res.redirect("/login"); });
 
+// GET /api/tiktok-creator-info?profileId=uuid — fetch creator_info for publish screen
+app.get("/api/tiktok-creator-info", requireAuth, async (req, res) => {
+  const profileId = (typeof req.query.profileId === "string" && UUID_RE.test(req.query.profileId)) ? req.query.profileId : null;
+  if (!profileId) return res.status(400).json({ error: "profileId required" });
+  try {
+    const channels = await query(
+      "SELECT * FROM sl_user_channels WHERE profile_id=$1 AND platform='tiktok' AND user_id=$2",
+      [profileId, req.session.userId]
+    );
+    const ch = channels[0];
+    if (!ch) return res.status(404).json({ error: "TikTok not connected" });
+    const info = await fetchTikTokCreatorInfo(ch.access_token);
+    res.json({
+      nickname: info.creator_nickname || ch.account_name,
+      username: info.creator_username || ch.account_name,
+      avatar: info.creator_avatar_url || null,
+      privacy_level_options: info.privacy_level_options || ["SELF_ONLY"],
+      comment_disabled: !!info.comment_disabled,
+      duet_disabled: !!info.duet_disabled,
+      stitch_disabled: !!info.stitch_disabled,
+      max_duration_sec: info.max_video_post_duration_sec || 300,
+    });
+  } catch (e) {
+    console.error("[creator-info]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ============= Dashboard — profile cards grid =============
 
 app.get("/dashboard", requireAuth, async (req, res) => {
@@ -992,6 +1046,8 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
     youtube ? `<option value="youtube" ${defaultPlatform === "youtube" ? "selected" : ""}>YouTube (@${escHtml(youtube.account_name)})</option>` : "",
   ].join("");
 
+  const profileIdJson = JSON.stringify(profile.id);
+
   res.send(layout("Publish Video", `
   <div class="publish-wrap">
     <a href="/profiles/${profile.id}" class="back-link">← ${escHtml(profile.name)}</a>
@@ -999,19 +1055,27 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
     <div id="result-box" style="display:none"></div>
     <form id="publish-form" enctype="multipart/form-data">
       <input type="hidden" name="profile_id" value="${profile.id}">
+      <input type="hidden" name="tt_privacy_level" id="tt-privacy-hidden" value="SELF_ONLY">
+      <input type="hidden" name="tt_disable_duet" id="tt-duet-hidden" value="false">
+      <input type="hidden" name="tt_disable_stitch" id="tt-stitch-hidden" value="false">
+      <input type="hidden" name="tt_disable_comment" id="tt-comment-hidden" value="false">
+
       <div class="form-group">
         <label>Platform</label>
         <select name="platform" id="platform-select">${opts}</select>
       </div>
+
       <div class="form-group">
-        <label>Video title</label>
-        <input type="text" name="title" placeholder="Enter video title..." maxlength="150">
+        <label>Video title / caption</label>
+        <input type="text" name="title" id="title-input" placeholder="Enter title or caption..." maxlength="150">
       </div>
+
+      <!-- YouTube-only fields -->
       <div class="form-group youtube-only" id="desc-group" style="display:none">
         <label>Description <span style="font-weight:400;color:#888">(YouTube)</span></label>
         <textarea name="description" rows="3" maxlength="5000" placeholder="Optional description..." style="width:100%;resize:vertical;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:#fff;font-size:14px;font-family:inherit"></textarea>
       </div>
-      <div class="form-group youtube-only" id="privacy-group" style="display:none">
+      <div class="form-group youtube-only" id="yt-privacy-group" style="display:none">
         <label>Privacy <span style="font-weight:400;color:#888">(YouTube)</span></label>
         <select name="privacy" id="privacy-select">
           <option value="private">Private — only you can see it</option>
@@ -1019,6 +1083,62 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
           <option value="public">Public — visible to everyone</option>
         </select>
       </div>
+
+      <!-- TikTok-only fields: loaded dynamically from creator_info -->
+      <div id="tt-section" style="display:none">
+        <div id="tt-account-card" class="tt-account-card" style="display:none">
+          <img id="tt-avatar" src="" alt="" style="width:40px;height:40px;border-radius:50%;object-fit:cover;flex-shrink:0;background:var(--border)">
+          <div>
+            <div id="tt-nickname" style="font-size:14px;font-weight:600;color:#fff"></div>
+            <div id="tt-username" style="font-size:12px;color:var(--muted)"></div>
+          </div>
+          <span class="badge-connected" style="margin-left:auto;font-size:11px">Connected</span>
+        </div>
+        <div id="tt-loading" style="font-size:13px;color:var(--muted);margin-bottom:16px;display:none">Loading TikTok settings…</div>
+        <div id="tt-error" style="display:none;margin-bottom:16px;padding:10px 14px;background:rgba(255,80,80,.1);border:1px solid rgba(255,80,80,.3);border-radius:8px;font-size:13px;color:#ff8080"></div>
+
+        <div class="form-group" id="tt-privacy-group" style="display:none">
+          <label>Privacy</label>
+          <select id="tt-privacy-select" onchange="document.getElementById('tt-privacy-hidden').value=this.value" style="width:100%;background:var(--card);border:1px solid var(--border);border-radius:8px;padding:10px 12px;color:#fff;font-size:14px;font-family:inherit"></select>
+        </div>
+
+        <div class="form-group" id="tt-toggles-group" style="display:none">
+          <label style="margin-bottom:12px;display:block">Interaction settings</label>
+          <div class="tt-toggles">
+            <label class="tt-toggle-row" id="tt-comment-row">
+              <div>
+                <div style="font-size:14px;color:#fff;font-weight:500">Allow comments</div>
+                <div style="font-size:12px;color:var(--muted)">Viewers can comment on this video</div>
+              </div>
+              <div class="toggle-wrap">
+                <input type="checkbox" id="tt-comment-check" checked onchange="document.getElementById('tt-comment-hidden').value=(!this.checked).toString()">
+                <span class="toggle-slider"></span>
+              </div>
+            </label>
+            <label class="tt-toggle-row" id="tt-duet-row">
+              <div>
+                <div style="font-size:14px;color:#fff;font-weight:500">Allow duet</div>
+                <div style="font-size:12px;color:var(--muted)">Others can create duet videos</div>
+              </div>
+              <div class="toggle-wrap">
+                <input type="checkbox" id="tt-duet-check" checked onchange="document.getElementById('tt-duet-hidden').value=(!this.checked).toString()">
+                <span class="toggle-slider"></span>
+              </div>
+            </label>
+            <label class="tt-toggle-row" id="tt-stitch-row">
+              <div>
+                <div style="font-size:14px;color:#fff;font-weight:500">Allow stitch</div>
+                <div style="font-size:12px;color:var(--muted)">Others can stitch with this video</div>
+              </div>
+              <div class="toggle-wrap">
+                <input type="checkbox" id="tt-stitch-check" checked onchange="document.getElementById('tt-stitch-hidden').value=(!this.checked).toString()">
+                <span class="toggle-slider"></span>
+              </div>
+            </label>
+          </div>
+        </div>
+      </div>
+
       <div class="form-group">
         <label>Video file</label>
         <div class="dropzone" id="dropzone" onclick="document.getElementById('video-input').click()">
@@ -1034,10 +1154,98 @@ app.get("/profiles/:id/publish", requireAuth, async (req, res) => {
         <div class="progress-label"><span id="progress-label-text">Uploading...</span><span id="progress-pct">0%</span></div>
         <div class="progress-bar"><div id="progress-fill"></div></div>
       </div>
-      <button type="submit" class="btn-primary full" id="submit-btn">Publish Video</button>
-      <p class="terms-note" id="terms-note">By publishing you agree to the platform's Terms of Service</p>
+      <button type="submit" class="btn-primary full" id="submit-btn">Publish to TikTok</button>
+      <p class="terms-note" id="terms-note">By publishing you agree to TikTok's Terms of Service and Content Posting guidelines</p>
     </form>
   </div>
+
+  <style>
+    .tt-account-card { display:flex;align-items:center;gap:12px;padding:12px 16px;background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:12px;margin-bottom:20px; }
+    .tt-toggles { display:flex;flex-direction:column;gap:0;border:1px solid var(--border);border-radius:12px;overflow:hidden; }
+    .tt-toggle-row { display:flex;align-items:center;justify-content:space-between;padding:14px 16px;cursor:pointer;transition:background .15s;gap:12px; }
+    .tt-toggle-row:not(:last-child) { border-bottom:1px solid var(--border); }
+    .tt-toggle-row:hover { background:rgba(255,255,255,.03); }
+    .tt-toggle-row.disabled { opacity:.4;pointer-events:none; }
+    .toggle-wrap { position:relative;flex-shrink:0; }
+    .toggle-wrap input[type=checkbox] { opacity:0;width:0;height:0;position:absolute; }
+    .toggle-slider { display:block;width:44px;height:24px;background:rgba(255,255,255,.15);border-radius:12px;cursor:pointer;transition:background .2s; }
+    .toggle-wrap input:checked + .toggle-slider { background:var(--green); }
+    .toggle-slider::before { content:'';position:absolute;width:18px;height:18px;background:#fff;border-radius:50%;top:3px;left:3px;transition:transform .2s; }
+    .toggle-wrap input:checked + .toggle-slider::before { transform:translateX(20px); }
+  </style>
+
+  <script>
+  const PROFILE_ID = ${profileIdJson};
+  const PRIVACY_LABELS = {
+    PUBLIC_TO_EVERYONE: "Public — everyone can see",
+    MUTUAL_FRIENDS_AND_FOLLOWERS: "Friends & Followers",
+    FOLLOWER_OF_CREATOR: "Followers only",
+    SELF_ONLY: "Private — only me",
+  };
+
+  let ttLoaded = false;
+
+  function onPlatformChange() {
+    const platform = document.getElementById('platform-select').value;
+    const isTT = platform === 'tiktok';
+    document.querySelectorAll('.youtube-only').forEach(el => el.style.display = isTT ? 'none' : '');
+    document.getElementById('tt-section').style.display = isTT ? '' : 'none';
+    document.getElementById('submit-btn').textContent = isTT ? 'Post to TikTok' : 'Publish to YouTube';
+    document.getElementById('terms-note').textContent = isTT
+      ? "By posting you agree to TikTok's Terms of Service and Community Guidelines"
+      : "By publishing you agree to YouTube's Terms of Service";
+    if (isTT && !ttLoaded) loadTikTokCreatorInfo();
+  }
+
+  async function loadTikTokCreatorInfo() {
+    const loading = document.getElementById('tt-loading');
+    const errEl = document.getElementById('tt-error');
+    const accountCard = document.getElementById('tt-account-card');
+    loading.style.display = '';
+    errEl.style.display = 'none';
+    try {
+      const r = await fetch('/api/tiktok-creator-info?profileId=' + PROFILE_ID);
+      const d = await r.json();
+      if (!r.ok) { errEl.textContent = d.error || 'Failed to load TikTok settings'; errEl.style.display = ''; loading.style.display = 'none'; return; }
+
+      // Account card
+      document.getElementById('tt-avatar').src = d.avatar || '';
+      document.getElementById('tt-nickname').textContent = d.nickname;
+      document.getElementById('tt-username').textContent = '@' + d.username;
+      accountCard.style.display = 'flex';
+
+      // Privacy dropdown
+      const sel = document.getElementById('tt-privacy-select');
+      sel.innerHTML = '';
+      (d.privacy_level_options || ['SELF_ONLY']).forEach(opt => {
+        const o = document.createElement('option');
+        o.value = opt;
+        o.textContent = PRIVACY_LABELS[opt] || opt;
+        sel.appendChild(o);
+      });
+      document.getElementById('tt-privacy-hidden').value = sel.value;
+      document.getElementById('tt-privacy-group').style.display = '';
+
+      // Toggles
+      function setToggle(id, rowId, disabled) {
+        const check = document.getElementById(id);
+        const row = document.getElementById(rowId);
+        if (disabled) { check.checked = false; check.dispatchEvent(new Event('change')); row.classList.add('disabled'); }
+        else { check.checked = true; row.classList.remove('disabled'); }
+      }
+      setToggle('tt-comment-check', 'tt-comment-row', d.comment_disabled);
+      setToggle('tt-duet-check', 'tt-duet-row', d.duet_disabled);
+      setToggle('tt-stitch-check', 'tt-stitch-row', d.stitch_disabled);
+      document.getElementById('tt-toggles-group').style.display = '';
+
+      ttLoaded = true;
+    } catch(e) { errEl.textContent = 'Network error loading TikTok settings'; errEl.style.display = ''; }
+    loading.style.display = 'none';
+  }
+
+  document.getElementById('platform-select').addEventListener('change', onPlatformChange);
+  onPlatformChange(); // init on load
+  </script>
   <script src="/publish.js"></script>
   `, user));
   } catch (e) { console.error("[publish-page]", e.message); res.redirect("/dashboard"); }
@@ -1071,9 +1279,22 @@ app.post("/api/publish", requireAuth, upload.single("video"), async (req, res) =
     pubId = pub.id;
 
     if (platform === "tiktok") {
-      const result = await doPublishTikTok(ch, { title: req.body.title || req.file.originalname, filePath: req.file.path, fileSize: req.file.size });
+      const ttPrivacy = req.body.tt_privacy_level || "SELF_ONLY";
+      const ttDisableDuet = req.body.tt_disable_duet === "true";
+      const ttDisableStitch = req.body.tt_disable_stitch === "true";
+      const ttDisableComment = req.body.tt_disable_comment === "true";
+      console.log(`[tiktok-upload] web title="${req.body.title}" privacy=${ttPrivacy} duet=${!ttDisableDuet} stitch=${!ttDisableStitch} comment=${!ttDisableComment}`);
+      const result = await doPublishTikTok(ch, {
+        title: req.body.title || req.file.originalname,
+        filePath: req.file.path,
+        fileSize: req.file.size,
+        privacyLevel: ttPrivacy,
+        disableDuet: ttDisableDuet,
+        disableStitch: ttDisableStitch,
+        disableComment: ttDisableComment,
+      });
       fs.unlinkSync(req.file.path);
-      await query("UPDATE sl_publications SET status='published',publish_id=$1,published_at=NOW(),updated_at=NOW() WHERE id=$2", [result.publishId, pubId]);
+      await query("UPDATE sl_publications SET status='published',publish_id=$1,privacy=$2,published_at=NOW(),updated_at=NOW() WHERE id=$3", [result.publishId, ttPrivacy.toLowerCase(), pubId]);
       return res.json({ ok: true, publication_id: pubId, publishId: result.publishId, platform: "tiktok", message: "Video uploaded to TikTok for processing" });
     }
 
