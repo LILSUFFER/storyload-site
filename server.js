@@ -20,7 +20,17 @@ const TIKTOK_CLIENT_SECRET = process.env.TIKTOK_CLIENT_SECRET || "";
 
 // ── Auth security ─────────────────────────────────────────────────────────────
 // Allowlist of valid platform names for OAuth routes
-const ALLOWED_PLATFORMS = new Set(["tiktok", "youtube"]);
+const ALLOWED_PLATFORMS = new Set(["tiktok", "youtube", "instagram"]);
+const { execFile } = require("child_process");
+
+// Default YouTube tags for the poker channels (user-provided list). A publish request
+// may override with its own `tags` array; empty/absent -> these.
+const DEFAULT_YT_TAGS = [
+  "poker", "poker clips", "poker shorts", "WPT", "world poker tour", "all in",
+  "poker all in", "final table", "texas holdem", "no limit holdem",
+  "poker highlights", "tournament poker", "big pot", "hero call", "poker bluff",
+  "high stakes poker",
+];
 // UUID v4 pattern — only accept this for profile_id params
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 // Returns a hardcoded internal redirect path — never trusts raw string from request
@@ -145,7 +155,7 @@ function formatPublication(p) {
   };
 }
 
-async function doPublishYouTube(ch, { title, description, privacy, filePath }) {
+async function doPublishYouTube(ch, { title, description, privacy, filePath, tags, comment }) {
   const ytClient = getGoogleClient(`${APP_URL}/auth/youtube/callback`);
   ytClient.setCredentials({
     access_token: ch.access_token,
@@ -157,21 +167,99 @@ async function doPublishYouTube(ch, { title, description, privacy, filePath }) {
   const safeDesc = (description || "").substring(0, 5000);
   const allowedPrivacy = new Set(["public", "private", "unlisted"]);
   const safePrivacy = allowedPrivacy.has(privacy) ? privacy : "private";
+  // Tags: request-provided or the poker defaults; YouTube caps the joined list at
+  // 500 chars — trim from the tail rather than fail the publish.
+  let safeTags = (Array.isArray(tags) && tags.length ? tags : DEFAULT_YT_TAGS)
+    .map((t) => String(t).trim()).filter(Boolean);
+  while (safeTags.join("").length + safeTags.length * 2 > 480) safeTags.pop();
   const response = await yt.videos.insert({
     part: ["snippet", "status"],
     requestBody: {
-      snippet: { title: safeTitle, description: safeDesc, categoryId: "22" },
+      snippet: { title: safeTitle, description: safeDesc, categoryId: "22", tags: safeTags },
       status: { privacyStatus: safePrivacy, selfDeclaredMadeForKids: false },
     },
     media: { body: fs.createReadStream(filePath) },
   });
   const videoId = response.data.id;
+  // Custom cover from the 2s frame — the clip's frame 0 is a black broadcast cut.
+  // Best-effort: custom thumbnails need a phone-verified channel; never fail the publish.
+  try {
+    const cover = filePath.replace(/\.[^.]+$/, "") + "_yt_cover.jpg";
+    await new Promise((resolve, reject) =>
+      execFile("ffmpeg", ["-nostdin", "-y", "-ss", "2", "-i", filePath, "-frames:v", "1", "-q:v", "3", cover],
+        { timeout: 60000 }, (e) => (e ? reject(e) : resolve())));
+    await yt.thumbnails.set({ videoId, media: { mimeType: "image/jpeg", body: fs.createReadStream(cover) } });
+    try { fs.unlinkSync(cover); } catch {}
+    console.log(`[youtube] custom 2s cover set on ${videoId}`);
+  } catch (te) {
+    console.error(`[youtube] cover set failed on ${videoId} (verified-channel/Shorts):`, te.message);
+  }
+  // CTA comment (owner comment under the video; pinning is one tap in the app).
+  // Needs youtube.force-ssl scope — tokens granted before the scope change will 403; non-fatal.
+  if (comment && String(comment).trim()) {
+    try {
+      await yt.commentThreads.insert({
+        part: ["snippet"],
+        requestBody: { snippet: { videoId, topLevelComment: { snippet: { textOriginal: String(comment).trim().substring(0, 9000) } } } },
+      });
+      console.log(`[youtube] CTA comment posted on ${videoId}`);
+    } catch (ce) {
+      console.error(`[youtube] CTA comment failed on ${videoId} (needs force-ssl scope reconnect?):`, ce.message);
+    }
+  }
   return {
     videoId,
     videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
     title: response.data.snippet?.title || safeTitle,
     privacyStatus: response.data.status?.privacyStatus || safePrivacy,
   };
+}
+
+// ── Instagram (Reels) ─────────────────────────────────────────────────────────
+// Rebuilt after the pod loss (the original lived only on the dead pod). Publishing
+// uses the IG Graph API with the channel's stored long-lived token: create a REELS
+// container from a public video URL (thumb 2s in), poll until FINISHED, publish.
+// Reconnect/OAuth flow is NOT rebuilt yet — existing sl_user_channels tokens are used.
+const IG_GRAPH = "https://graph.instagram.com/v23.0";
+
+async function igApi(method, pathPart, token, params = {}) {
+  const url = new URL(`${IG_GRAPH}/${pathPart}`);
+  const body = new URLSearchParams({ ...params, access_token: token });
+  const res = method === "GET"
+    ? await fetch(`${url}?${body}`)
+    : await fetch(url, { method: "POST", body });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(`IG ${pathPart}: ${data.error?.message || res.status}`);
+  return data;
+}
+
+async function doPublishInstagram(ch, { caption, videoUrl }) {
+  if (!videoUrl) throw new Error("instagram requires a public video_url");
+  const igUserId = ch.account_id;
+  const token = ch.access_token;
+  const container = await igApi("POST", `${igUserId}/media`, token, {
+    media_type: "REELS",
+    video_url: videoUrl,
+    caption: (caption || "").substring(0, 2200),
+    thumb_offset: "2000", // cover from the 2nd second — frame 0 is a black broadcast cut
+  });
+  // Poll container until FINISHED (IG transcodes the download; ~10-120s typical)
+  let status = "IN_PROGRESS";
+  for (let i = 0; i < 60 && status !== "FINISHED"; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const st = await igApi("GET", `${container.id}?fields=status_code`, token);
+    status = st.status_code;
+    if (status === "ERROR") throw new Error("IG container processing failed");
+  }
+  if (status !== "FINISHED") throw new Error("IG container timed out");
+  const pub = await igApi("POST", `${igUserId}/media_publish`, token, { creation_id: container.id });
+  let permalink = "";
+  try { permalink = (await igApi("GET", `${pub.id}?fields=permalink`, token)).permalink || ""; } catch {}
+  return { mediaId: pub.id, videoUrl: permalink };
+}
+
+async function postInstagramComment(ch, mediaId, text) {
+  await igApi("POST", `${mediaId}/comments`, ch.access_token, { message: String(text).trim().substring(0, 2200) });
 }
 
 async function fetchTikTokCreatorInfo(accessToken) {
@@ -267,11 +355,12 @@ function flexUpload(req, res, next) {
 
 // Fire-and-forget background publish worker.
 // Called AFTER 202 is already sent — must never throw uncaught.
-async function publishInBackground(pubId, { platform, ch, filePath, fileSize, originalName, videoUrl, title, description, privacy }) {
+async function publishInBackground(pubId, { platform, ch, filePath, fileSize, originalName, videoUrl, title, description, privacy, tags, comment }) {
   let downloadedPath = null;
   try {
-    // Resolve file: already on disk (multer upload) or need to download
-    if (videoUrl && !filePath) {
+    // Resolve file: already on disk (multer upload) or need to download.
+    // Instagram is URL-based (Graph API downloads it) — keep the URL, skip the local file.
+    if (videoUrl && !filePath && platform !== "instagram") {
       const dl = await downloadVideoFromUrl(videoUrl);
       filePath = downloadedPath = dl.filePath;
       fileSize = dl.fileSize;
@@ -284,11 +373,22 @@ async function publishInBackground(pubId, { platform, ch, filePath, fileSize, or
       await query("UPDATE sl_publications SET status='published',publish_id=$1,published_at=NOW(),updated_at=NOW() WHERE id=$2", [result.publishId, pubId]);
       console.log(`[bg] pub=${pubId} tiktok published publish_id=${result.publishId}`);
     } else if (platform === "youtube") {
-      const result = await doPublishYouTube(ch, { title: title || originalName, description, privacy, filePath });
+      const result = await doPublishYouTube(ch, { title: title || originalName, description, privacy, filePath, tags, comment });
       try { fs.unlinkSync(filePath); } catch {}
       await query("UPDATE sl_publications SET status='published',video_id=$1,video_url=$2,privacy=$3,published_at=NOW(),updated_at=NOW() WHERE id=$4",
         [result.videoId, result.videoUrl, result.privacyStatus, pubId]);
       console.log(`[bg] pub=${pubId} youtube published videoId=${result.videoId}`);
+    } else if (platform === "instagram") {
+      if (!videoUrl) throw new Error("instagram requires video_url (public URL for the Graph API)");
+      const caption = [title || originalName || "", description || ""].filter(Boolean).join("\n\n");
+      const result = await doPublishInstagram(ch, { caption, videoUrl });
+      await query("UPDATE sl_publications SET status='published',video_id=$1,video_url=$2,published_at=NOW(),updated_at=NOW() WHERE id=$3",
+        [result.mediaId, result.videoUrl, pubId]);
+      console.log(`[bg] pub=${pubId} instagram published mediaId=${result.mediaId}`);
+      if (comment && String(comment).trim()) {
+        try { await postInstagramComment(ch, result.mediaId, comment); console.log(`[bg] pub=${pubId} instagram CTA comment posted`); }
+        catch (ce) { console.error(`[bg] pub=${pubId} instagram comment failed:`, ce.message); }
+      }
     }
   } catch (e) {
     if (downloadedPath) try { fs.unlinkSync(downloadedPath); } catch {}
@@ -671,7 +771,7 @@ app.get("/auth/youtube", requireAuth, (req, res) => {
   req.session.oauthState = state;
   req.session.oauthProfileId = profileId;
   const client = getGoogleClient(`${APP_URL}/auth/youtube/callback`);
-  const url = client.generateAuthUrl({ access_type: "offline", scope: ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly"], state, prompt: "consent" });
+  const url = client.generateAuthUrl({ access_type: "offline", scope: ["https://www.googleapis.com/auth/youtube.upload", "https://www.googleapis.com/auth/youtube.readonly", "https://www.googleapis.com/auth/youtube.force-ssl"], state, prompt: "consent" });
   res.redirect(url);
 });
 
@@ -1576,7 +1676,9 @@ app.get("/v1/profiles/:id", requireApiKey, async (req, res) => {
 // POST /v1/profiles/:id/publish — publish to a specific profile channel (multipart or JSON video_url).
 // Returns 202 immediately. Poll GET /v1/publications/:id for status.
 app.post("/v1/profiles/:id/publish", requireApiKey, flexUpload, async (req, res) => {
-  const { platform, title, description, privacy, video_url } = req.body;
+  const { platform, title, description, privacy, video_url, comment } = req.body;
+  const tags = Array.isArray(req.body.tags) ? req.body.tags
+    : (typeof req.body.tags === "string" && req.body.tags.trim() ? req.body.tags.split(",").map(s => s.trim()) : null);
   const hasFile = !!req.file;
   const hasUrl = typeof video_url === "string" && video_url.startsWith("http");
 
@@ -1612,7 +1714,7 @@ app.post("/v1/profiles/:id/publish", requireApiKey, flexUpload, async (req, res)
       fileSize: hasFile ? req.file.size : null,
       originalName: hasFile ? req.file.originalname : null,
       videoUrl: hasUrl ? video_url : null,
-      title, description, privacy,
+      title, description, privacy, tags, comment,
     });
   } catch (e) {
     if (req.file?.path) try { fs.unlinkSync(req.file.path); } catch {}
@@ -1657,7 +1759,9 @@ app.get("/v1/publications", requireApiKey, async (req, res) => {
 // Accepts: multipart/form-data (video file) OR application/json (video_url).
 // Always returns 202 immediately. Poll GET /v1/publications/:id for status.
 app.post("/v1/publications", requireApiKey, flexUpload, async (req, res) => {
-  const { profile_id, platform, title, description, privacy, status: reqStatus, video_url } = req.body;
+  const { profile_id, platform, title, description, privacy, status: reqStatus, video_url, comment } = req.body;
+  const tags = Array.isArray(req.body.tags) ? req.body.tags
+    : (typeof req.body.tags === "string" && req.body.tags.trim() ? req.body.tags.split(",").map(s => s.trim()) : null);
   const wantPublish = !reqStatus || reqStatus === "published";
   const hasFile = !!req.file;
   const hasUrl = typeof video_url === "string" && video_url.startsWith("http");
@@ -1720,7 +1824,7 @@ app.post("/v1/publications", requireApiKey, flexUpload, async (req, res) => {
       fileSize: hasFile ? req.file.size : null,
       originalName: hasFile ? req.file.originalname : null,
       videoUrl: hasUrl ? video_url : null,
-      title, description, privacy,
+      title, description, privacy, tags, comment,
     });
 
   } catch (e) {
