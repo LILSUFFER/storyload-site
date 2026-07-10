@@ -225,8 +225,12 @@ const IG_GRAPH = "https://graph.instagram.com/v23.0";
 async function igApi(method, pathPart, token, params = {}) {
   const url = new URL(`${IG_GRAPH}/${pathPart}`);
   const body = new URLSearchParams({ ...params, access_token: token });
+  // pathPart may already carry a query ('{id}?fields=status_code') — join with '&',
+  // else the token lands after a SECOND '?' and IG replies "Invalid OAuth 2.0 Access
+  // Token" on every status poll (7 publishes died on this while the container создавался).
+  const sep = pathPart.includes("?") ? "&" : "?";
   const res = method === "GET"
-    ? await fetch(`${url}?${body}`)
+    ? await fetch(`${IG_GRAPH}/${pathPart}${sep}${body}`)
     : await fetch(url, { method: "POST", body });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || data.error) throw new Error(`IG ${pathPart}: ${data.error?.message || res.status}`);
